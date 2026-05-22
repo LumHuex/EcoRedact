@@ -12,8 +12,6 @@
 
 namespace EcoRedact {
 
-// ==================== 辅助函数 ====================
-
 static std::string BytesToHexStringBlock(const unsigned char* bytes, size_t len) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
@@ -37,7 +35,7 @@ static std::string XorStringsBlockHelper(const std::string& a, const std::string
     return result;
 }
 
-
+// 证明子块
 std::string ProofSubBlock::ToString() const {
     std::stringstream ss;
     ss << index << "|" << signature_on_prev << "|" << manager_id << "|" 
@@ -49,11 +47,11 @@ std::string ProofSubBlock::ComputeHash() const {
     return ComputeSHA256StringBlock(ToString());
 }
 
-
+// 签名子块
 std::string SignatureSubBlock::ToString() const {
     std::stringstream ss;
     ss << index << "|" << manager_id << "|" 
-       << signature_on_prev << "|" << public_key;
+       << signature_on_prev << "|" << public_key << "|" << xor_signature;
     return ss.str();
 }
 
@@ -61,10 +59,10 @@ std::string SignatureSubBlock::ComputeHash() const {
     return ComputeSHA256StringBlock(ToString());
 }
 
-
+// 交易子块
 std::string TransactionSubBlock::ToString() const {
     std::stringstream ss;
-    ss << tx_id << "|" << aid << "|" << root_apk << "|" << deri_info << "|" << register_time;
+    ss << tx_id << "|" << aid << "|" << root_apk << "|" << register_time;
     return ss.str();
 }
 
@@ -72,6 +70,41 @@ std::string TransactionSubBlock::ComputeHash() const {
     return ComputeSHA256StringBlock(ToString());
 }
 
+// 修改记录
+std::string ModificationRecord::ToString() const {
+    std::stringstream ss;
+    ss << "revise|" << tx_id << "|" << timestamp << "|" << block_id << "|" << reason << "|";
+    
+    // 旧随机数
+    for (size_t i = 0; i < old_random_numbers.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << old_random_numbers[i];
+    }
+    ss << "|";
+    
+    // 新随机数
+    for (size_t i = 0; i < new_random_numbers.size(); i++) {
+        if (i > 0) ss << ",";
+        ss << new_random_numbers[i];
+    }
+    ss << "|";
+    
+    // 旧交易哈希
+    std::string old_hash;
+    for (const auto& tx : old_transactions) old_hash += tx.ComputeHash();
+    ss << ComputeSHA256StringBlock(old_hash) << "|";
+    
+    // 新交易哈希
+    std::string new_hash;
+    for (const auto& tx : new_transactions) new_hash += tx.ComputeHash();
+    ss << ComputeSHA256StringBlock(new_hash);
+    
+    return ss.str();
+}
+
+std::string ModificationRecord::ComputeHash() const {
+    return ComputeSHA256StringBlock(ToString());
+}
 
 Block::Block() : height(0), proof_hash(""), timestamp(0) {}
 
@@ -79,27 +112,17 @@ std::string Block::ComputeProofHash() const {
     return ComputeSHA256StringBlock(signature.ComputeHash());
 }
 
-
 std::string Block::ComputeTransactionsHash() const {
-    if (transactions.empty()) return ComputeSHA256StringBlock("EMPTY");
+    if (transactions.empty()) {
+        return ComputeSHA256StringBlock("EMPTY");
+    }
     std::string combined;
     for (const auto& tx : transactions) combined += tx.ComputeHash();
     return ComputeSHA256StringBlock(combined);
 }
 
 void Block::Print() const {
-    /*
-    std::cout << "  ┌─────────────────────────────────────────" << std::endl;
-    std::cout << "  │ 区块高度: " << height << std::endl;
-    std::cout << "  │ 证明链哈希: " << proof_hash.substr(0, 32) << "..." << std::endl;
-    std::cout << "  │ 时间戳: " << timestamp << std::endl;
-    std::cout << "  │ 交易数量: " << transactions.size() << std::endl;
-    std::cout << "  │ 记账管理员: " << signature.manager_id << std::endl;
-    std::cout << "  └─────────────────────────────────────────" << std::endl;
-    for (const auto& tx : transactions) {
-        std::cout << "      ├─ AID: " << tx.aid.substr(0, 32) << "..." << std::endl;
-    }
-    */
+    std::cout << "Block " << height << ": proof_hash=" << proof_hash.substr(0, 16) << "...\n";
 }
 
 int Block::FindTransactionIndex(const std::string& aid) const {
@@ -109,7 +132,6 @@ int Block::FindTransactionIndex(const std::string& aid) const {
     return -1;
 }
 
-// 物理撤销
 bool Block::PhysicalRevokeTransaction(const std::string& aid,
                                        const std::string& new_xor_signature) {
     int tx_index = FindTransactionIndex(aid);
@@ -118,23 +140,13 @@ bool Block::PhysicalRevokeTransaction(const std::string& aid,
         return false;
     }
     
-    std::string old_proof_hash = proof_hash;
-    std::string revoked_aid = transactions[tx_index].aid;
-
     transactions.erase(transactions.begin() + tx_index);
-    std::cout << "    已删除恶意车辆的交易" << std::endl;
-    
     signature.xor_signature = new_xor_signature;
-    
     proof_hash = ComputeProofHash();
-
-    
-    std::cout << "  [物理撤销] 成功删除 AID: " << revoked_aid.substr(0, 32) << "..." << std::endl;
     
     return true;
 }
 
-// ==================== Blockchain ====================
 
 Blockchain::Blockchain() {
     if (!std::filesystem::exists("./keys/blockchain")) {
@@ -158,10 +170,193 @@ std::string Blockchain::XorStrings(const std::string& a, const std::string& b) {
     return XorStringsBlockHelper(a, b);
 }
 
-// 初始化创世区块
-bool Blockchain::InitGenesisBlock() {
-    std::cout << "\n  [创世区块] 初始化区块链..." << std::endl;
+bool Blockchain::SerializeBlock(const Block& block, std::ofstream& file) {
+    if (!file.is_open()) return false;
     
+    // 写入高度
+    file.write(reinterpret_cast<const char*>(&block.height), sizeof(block.height));
+    
+    // 写入时间戳
+    file.write(reinterpret_cast<const char*>(&block.timestamp), sizeof(block.timestamp));
+    
+    // 写入proof_hash
+    size_t hash_len = block.proof_hash.length();
+    file.write(reinterpret_cast<const char*>(&hash_len), sizeof(hash_len));
+    file.write(block.proof_hash.c_str(), hash_len);
+    
+    // 序列化证明子块 - 使用字符串形式
+    std::string proof_str = block.proof.ToString();
+    size_t proof_len = proof_str.length();
+    file.write(reinterpret_cast<const char*>(&proof_len), sizeof(proof_len));
+    file.write(proof_str.c_str(), proof_len);
+    
+    // 序列化签名子块
+    std::string sig_str = block.signature.ToString();
+    size_t sig_len = sig_str.length();
+    file.write(reinterpret_cast<const char*>(&sig_len), sizeof(sig_len));
+    file.write(sig_str.c_str(), sig_len);
+    
+    // 写入交易数量
+    size_t tx_count = block.transactions.size();
+    file.write(reinterpret_cast<const char*>(&tx_count), sizeof(tx_count));
+    
+    // 序列化每个交易
+    for (const auto& tx : block.transactions) {
+        std::string tx_str = tx.ToString();
+        size_t tx_len = tx_str.length();
+        file.write(reinterpret_cast<const char*>(&tx_len), sizeof(tx_len));
+        file.write(tx_str.c_str(), tx_len);
+    }
+    
+    return file.good();
+}
+
+bool Blockchain::DeserializeBlock(Block& block, std::ifstream& file) {
+    if (!file.is_open()) return false;
+    
+    // 读取高度
+    file.read(reinterpret_cast<char*>(&block.height), sizeof(block.height));
+    if (file.eof() || file.fail()) return false;
+    
+    // 读取时间戳
+    file.read(reinterpret_cast<char*>(&block.timestamp), sizeof(block.timestamp));
+    
+    // 读取proof_hash
+    size_t hash_len;
+    file.read(reinterpret_cast<char*>(&hash_len), sizeof(hash_len));
+    block.proof_hash.resize(hash_len);
+    file.read(&block.proof_hash[0], hash_len);
+    
+    // 读取证明子块
+    size_t proof_len;
+    file.read(reinterpret_cast<char*>(&proof_len), sizeof(proof_len));
+    std::string proof_str(proof_len, '\0');
+    file.read(&proof_str[0], proof_len);
+    
+    // 解析proof_str - 按|分隔解析
+    std::vector<std::string> proof_parts;
+    std::stringstream proof_ss(proof_str);
+    std::string part;
+    while (std::getline(proof_ss, part, '|')) {
+        proof_parts.push_back(part);
+    }
+    if (proof_parts.size() >= 7) {
+        block.proof.index = std::stoi(proof_parts[0]);
+        block.proof.signature_on_prev = proof_parts[1];
+        block.proof.manager_id = proof_parts[2];
+        block.proof.merkle_root = proof_parts[3];
+        block.proof.proof_challenge = proof_parts[4];
+        block.proof.quality = std::stod(proof_parts[5]);
+        block.proof.timestamp = std::stoull(proof_parts[6]);
+    }
+    
+    // 读取签名子块
+    size_t sig_len;
+    file.read(reinterpret_cast<char*>(&sig_len), sizeof(sig_len));
+    std::string sig_str(sig_len, '\0');
+    file.read(&sig_str[0], sig_len);
+    
+    // 解析sig_str
+    std::vector<std::string> sig_parts;
+    std::stringstream sig_ss(sig_str);
+    while (std::getline(sig_ss, part, '|')) {
+        sig_parts.push_back(part);
+    }
+    if (sig_parts.size() >= 5) {
+        block.signature.index = std::stoi(sig_parts[0]);
+        block.signature.manager_id = sig_parts[1];
+        block.signature.signature_on_prev = sig_parts[2];
+        block.signature.public_key = sig_parts[3];
+        block.signature.xor_signature = sig_parts[4];
+    }
+    
+    // 读取交易数量
+    size_t tx_count;
+    file.read(reinterpret_cast<char*>(&tx_count), sizeof(tx_count));
+    
+    // 读取每个交易
+    block.transactions.clear();
+    for (size_t i = 0; i < tx_count; i++) {
+        size_t tx_len;
+        file.read(reinterpret_cast<char*>(&tx_len), sizeof(tx_len));
+        std::string tx_str(tx_len, '\0');
+        file.read(&tx_str[0], tx_len);
+        
+        // 解析tx_str
+        std::vector<std::string> tx_parts;
+        std::stringstream tx_ss(tx_str);
+        while (std::getline(tx_ss, part, '|')) {
+            tx_parts.push_back(part);
+        }
+        if (tx_parts.size() >= 5) {
+            TransactionSubBlock tx;
+            tx.tx_id = tx_parts[0];
+            tx.aid = tx_parts[1];
+            tx.root_apk = tx_parts[2];
+            tx.register_time = std::stoull(tx_parts[3]);
+            block.transactions.push_back(tx);
+        }
+    }
+    
+    return file.good();
+}
+
+bool Blockchain::SerializeModificationRecord(const ModificationRecord& record, std::ofstream& file) {
+    if (!file.is_open()) return false;
+    
+    std::string record_str = record.ToString();
+    size_t len = record_str.length();
+    file.write(reinterpret_cast<const char*>(&len), sizeof(len));
+    file.write(record_str.c_str(), len);
+    
+    return file.good();
+}
+
+bool Blockchain::DeserializeModificationRecord(ModificationRecord& record, std::ifstream& file) {
+    if (!file.is_open()) return false;
+    
+    size_t len;
+    file.read(reinterpret_cast<char*>(&len), sizeof(len));
+    if (file.eof() || file.fail() || len == 0) return false;
+    
+    std::string record_str(len, '\0');
+    file.read(&record_str[0], len);
+    
+    // 解析记录: revise|tx_id|timestamp|block_id|reason|old_randoms|new_randoms|old_hash|new_hash
+    std::vector<std::string> parts;
+    std::stringstream ss(record_str);
+    std::string part;
+    while (std::getline(ss, part, '|')) {
+        parts.push_back(part);
+    }
+    
+    if (parts.size() >= 9 && parts[0] == "revise") {
+        record.tx_id = parts[1];
+        record.timestamp = std::stoull(parts[2]);
+        record.block_id = std::stoi(parts[3]);
+        record.reason = parts[4];
+        
+        // 解析旧随机数
+        std::stringstream old_ss(parts[5]);
+        record.old_random_numbers.clear();
+        while (std::getline(old_ss, part, ',')) {
+            if (!part.empty()) record.old_random_numbers.push_back(part);
+        }
+        
+        // 解析新随机数
+        std::stringstream new_ss(parts[6]);
+        record.new_random_numbers.clear();
+        while (std::getline(new_ss, part, ',')) {
+            if (!part.empty()) record.new_random_numbers.push_back(part);
+        }
+        
+        return true;
+    }
+    
+    return false;
+}
+
+bool Blockchain::InitGenesisBlock() {
     Block genesis;
     genesis.height = 0;
     genesis.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -186,11 +381,9 @@ bool Blockchain::InitGenesisBlock() {
     chain_.push_back(genesis);
     aid_to_height_.clear();
     
-    std::cout << "  [创世区块] 创建成功，证明链哈希: " << genesis.proof_hash.substr(0, 32) << "..." << std::endl;
     return SaveToFile();
 }
 
-// 添加新区块
 bool Blockchain::AddBlock(const Block& block) {
     if (block.height != static_cast<int>(chain_.size())) {
         std::cerr << "错误: 区块高度不匹配" << std::endl;
@@ -220,9 +413,29 @@ bool Blockchain::AddBlock(const Block& block) {
         aid_to_height_[tx.aid] = block.height;
     }
     
-    std::cout << "  [区块链] 新区块已添加，高度: " << block.height 
-              << "，交易数: " << block.transactions.size() << std::endl;
     return SaveToFile();
+}
+
+bool Blockchain::AddModificationRecord(const ModificationRecord& record) {
+    modification_history_.push_back(record);
+    
+    // 保存到文件
+    std::ofstream file(modify_file_, std::ios::binary | std::ios::app);
+    if (!file.is_open()) return false;
+    
+    bool result = SerializeModificationRecord(record, file);
+    file.close();
+    return result;
+}
+
+std::vector<ModificationRecord> Blockchain::GetModificationRecords(int block_id) const {
+    std::vector<ModificationRecord> result;
+    for (const auto& record : modification_history_) {
+        if (record.block_id == block_id) {
+            result.push_back(record);
+        }
+    }
+    return result;
 }
 
 Block* Blockchain::GetBlock(int height) {
@@ -245,7 +458,6 @@ int Blockchain::GetLatestHeight() const {
     return static_cast<int>(chain_.size()) - 1;
 }
 
-// 物理撤销
 bool Blockchain::PhysicalRevokeTransaction(const std::string& aid,
                                             const std::string& new_xor_signature) {
     auto it = aid_to_height_.find(aid);
@@ -255,63 +467,82 @@ bool Blockchain::PhysicalRevokeTransaction(const std::string& aid,
     }
     
     int height = it->second;
-    std::cout << "\n  [物理撤销] 开始处理 AID: " << aid.substr(0, 32) << "..." 
-              << " (位于区块高度 " << height << ")" << std::endl;
-    
     bool success = chain_[height].PhysicalRevokeTransaction(aid, new_xor_signature);
     
     if (success) {
         aid_to_height_.erase(aid);
         SaveToFile();
-        std::cout << "  [物理撤销] 完成，AID 已从链上物理删除" << std::endl;
     }
     
     return success;
 }
 
-// 保存到文件
 bool Blockchain::SaveToFile() {
     std::ofstream file(storage_file_, std::ios::binary);
     if (!file.is_open()) return false;
+    
     size_t chain_size = chain_.size();
     file.write(reinterpret_cast<const char*>(&chain_size), sizeof(chain_size));
+    
+    for (const auto& block : chain_) {
+        if (!SerializeBlock(block, file)) {
+            return false;
+        }
+    }
+    
     file.close();
     return true;
 }
 
-// 从文件加载
 bool Blockchain::LoadFromFile() {
     if (!std::filesystem::exists(storage_file_)) {
-        std::cout << "  [区块链] 存储文件不存在，将创建新区块链" << std::endl;
         return InitGenesisBlock();
     }
+    
     std::ifstream file(storage_file_, std::ios::binary);
     if (!file.is_open()) {
-        std::cout << "  [区块链] 无法打开存储文件，将创建新区块链" << std::endl;
         return InitGenesisBlock();
     }
     
-    file.seekg(0, std::ios::end);
-    size_t file_size = file.tellg();
-    file.seekg(0, std::ios::beg);
+    size_t chain_size;
+    file.read(reinterpret_cast<char*>(&chain_size), sizeof(chain_size));
     
-    std::cout << "  [区块链] 找到存储文件，大小: " << file_size << " 字节" << std::endl;
+    chain_.clear();
+    aid_to_height_.clear();
+    
+    for (size_t i = 0; i < chain_size; i++) {
+        Block block;
+        if (!DeserializeBlock(block, file)) {
+            std::cerr << "警告: 读取区块失败" << std::endl;
+            break;
+        }
+        chain_.push_back(block);
+        for (const auto& tx : block.transactions) {
+            aid_to_height_[tx.aid] = block.height;
+        }
+    }
     
     file.close();
-
-    return InitGenesisBlock();
-}
-
-// 打印区块链状态
-void Blockchain::PrintBlockchain() const {
-    /*
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "  区块链状态" << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << "  区块总数: " << chain_.size() << std::endl;
-    std::cout << "  活跃 AID 数量: " << aid_to_height_.size() << std::endl;
-    for (const auto& block : chain_) block.Print();
-    */
+    
+    // 加载修改历史
+    if (std::filesystem::exists(modify_file_)) {
+        std::ifstream mod_file(modify_file_, std::ios::binary);
+        if (mod_file.is_open()) {
+            modification_history_.clear();
+            while (true) {
+                ModificationRecord record;
+                if (!DeserializeModificationRecord(record, mod_file)) break;
+                modification_history_.push_back(record);
+            }
+            mod_file.close();
+        }
+    }
+    
+    if (chain_.empty()) {
+        return InitGenesisBlock();
+    }
+    
+    return true;
 }
 
 } // namespace EcoRedact
