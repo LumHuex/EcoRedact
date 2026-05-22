@@ -17,113 +17,9 @@
 #include <openssl/pem.h>
 #include <openssl/ecdh.h>
 #include <openssl/aes.h>
+#include <algorithm>
 
 namespace EcoRedact {
-
-// ==================== AES-CTR 线性加密/解密 ====================
-
-std::vector<unsigned char> EcoRedactSystem::DeriveKeyFromPublicKey(EC_POINT* pk) {
-    BIGNUM* x = BN_new();
-    EC_POINT_get_affine_coordinates(current_params_->group, pk, x, nullptr, current_params_->ctx);
-    
-    unsigned char x_bytes[32];
-    BN_bn2binpad(x, x_bytes, 32);
-    
-    std::vector<unsigned char> key(32);
-    SHA256(x_bytes, 32, key.data());
-    
-    BN_free(x);
-    return key;
-}
-
-
-std::vector<unsigned char> EcoRedactSystem::DeriveKeyFromPrivateKey(BIGNUM* private_key) {
-    EC_POINT* pub_key = EC_POINT_new(current_params_->group);
-    EC_POINT_mul(current_params_->group, pub_key, private_key, nullptr, nullptr, current_params_->ctx);
-    
-    BIGNUM* x = BN_new();
-    EC_POINT_get_affine_coordinates(current_params_->group, pub_key, x, nullptr, current_params_->ctx);
-    
-    unsigned char x_bytes[32];
-    BN_bn2binpad(x, x_bytes, 32);
-    
-    std::vector<unsigned char> key(32);
-    SHA256(x_bytes, 32, key.data());
-    
-    BN_free(x);
-    EC_POINT_free(pub_key);
-    
-    return key;
-}
-
-
-std::string EcoRedactSystem::AESCTREncrypt(const std::vector<unsigned char>& key, const std::string& plaintext) {
-    const int NONCE_LEN = 16;
-    
-    unsigned char nonce[NONCE_LEN];
-    RAND_bytes(nonce, NONCE_LEN);
-
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    
-    EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), nullptr, key.data(), nonce);
-    
-    // 加密
-    std::vector<unsigned char> ciphertext(plaintext.length());
-    int len = 0;
-    EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
-                      reinterpret_cast<const unsigned char*>(plaintext.data()),
-                      plaintext.length());
-    
-    EVP_CIPHER_CTX_free(ctx);
-    
-    std::string result;
-    result.append(reinterpret_cast<char*>(nonce), NONCE_LEN);
-    result.append(reinterpret_cast<char*>(ciphertext.data()), len);
-    
-    return result;
-}
-
-
-std::string EcoRedactSystem::AESCTRDecrypt(const std::vector<unsigned char>& key, const std::string& ciphertext) {
-    const int NONCE_LEN = 16;
-    
-    if (ciphertext.length() < NONCE_LEN) {
-        return "";
-    }
-    
-    const unsigned char* nonce = reinterpret_cast<const unsigned char*>(ciphertext.data());
-    
-    // 提取密文
-    size_t enc_len = ciphertext.length() - NONCE_LEN;
-    const unsigned char* enc_data = reinterpret_cast<const unsigned char*>(ciphertext.data() + NONCE_LEN);
-    
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    
-    EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), nullptr, key.data(), nonce);
-    
-    // 解密
-    std::vector<unsigned char> plaintext(enc_len);
-    int len = 0;
-    EVP_DecryptUpdate(ctx, plaintext.data(), &len, enc_data, enc_len);
-    
-    EVP_CIPHER_CTX_free(ctx);
-    
-    return std::string(reinterpret_cast<char*>(plaintext.data()), len);
-}
-
-
-std::string EcoRedactSystem::EncryptWithManagerKey(const std::string& plaintext, EC_POINT* manager_pk) {
-    std::vector<unsigned char> key = DeriveKeyFromPublicKey(manager_pk);
-    return AESCTREncrypt(key, plaintext);
-}
-
-
-std::string EcoRedactSystem::DecryptWithManagerKey(const std::string& ciphertext, BIGNUM* manager_sk) {
-    std::vector<unsigned char> key = DeriveKeyFromPrivateKey(manager_sk);
-    return AESCTRDecrypt(key, ciphertext);
-}
-
-// ==================== 辅助函数 ====================
 
 static std::string XorStringsInternal(const std::string& a, const std::string& b) {
     size_t max_len = std::max(a.size(), b.size());
@@ -151,6 +47,7 @@ static std::string ComputeSHA256StringStatic(const std::string& input) {
 static std::string PointToHex(EC_GROUP* group, EC_POINT* point) {
     if (!point) return "";
     char* hex = EC_POINT_point2hex(group, point, POINT_CONVERSION_COMPRESSED, nullptr);
+    if (!hex) return "";
     std::string result(hex);
     OPENSSL_free(hex);
     return result;
@@ -158,7 +55,7 @@ static std::string PointToHex(EC_GROUP* group, EC_POINT* point) {
 
 static std::vector<unsigned char> HexToBytesStatic(const std::string& hex) {
     std::vector<unsigned char> bytes;
-    for (size_t i = 0; i < hex.length(); i += 2) {
+    for (size_t i = 0; i + 1 < hex.length(); i += 2) {
         std::string byte_str = hex.substr(i, 2);
         unsigned char byte = static_cast<unsigned char>(std::stoi(byte_str, nullptr, 16));
         bytes.push_back(byte);
@@ -166,10 +63,143 @@ static std::vector<unsigned char> HexToBytesStatic(const std::string& hex) {
     return bytes;
 }
 
-// ==================== SystemParams 实现 ====================
+// ECIES 加密/解密（陷门单向函数）
+std::string EcoRedactSystem::ECIESEncrypt(const std::string& plaintext, EC_POINT* public_key) {
+    if (!public_key || !current_params_ || !current_params_->group) {
+        std::cerr << "错误: ECIES加密参数无效" << std::endl;
+        return "";
+    }
+    
+    // 将十六进制字符串转换为二进制数据
+    std::vector<unsigned char> plaintext_bytes;
+    for (size_t i = 0; i + 1 < plaintext.length(); i += 2) {
+        std::string byte_str = plaintext.substr(i, 2);
+        unsigned char byte = static_cast<unsigned char>(std::stoi(byte_str, nullptr, 16));
+        plaintext_bytes.push_back(byte);
+    }
+    
+    // 如果转换失败，尝试作为ASCII字符串处理
+    if (plaintext_bytes.empty()) {
+        plaintext_bytes.assign(plaintext.begin(), plaintext.end());
+    }
+    
+    unsigned char hash[32];
+    SHA256(reinterpret_cast<const unsigned char*>(plaintext.c_str()), plaintext.length(), hash);
+    BIGNUM* ephemeral_sk = BN_new();
+    BN_bin2bn(hash, 32, ephemeral_sk);
+    BN_mod(ephemeral_sk, ephemeral_sk, current_params_->q, current_params_->ctx);
+    
+    EC_POINT* ephemeral_pk = EC_POINT_new(current_params_->group);
+    EC_POINT_mul(current_params_->group, ephemeral_pk, ephemeral_sk, nullptr, nullptr, current_params_->ctx);
+    
+    EC_POINT* shared_point = EC_POINT_new(current_params_->group);
+    EC_POINT_mul(current_params_->group, shared_point, nullptr, public_key, ephemeral_sk, current_params_->ctx);
+    
+    char* shared_hex = EC_POINT_point2hex(current_params_->group, shared_point, 
+                                           POINT_CONVERSION_COMPRESSED, current_params_->ctx);
+    std::vector<unsigned char> aes_key(32);
+    SHA256(reinterpret_cast<const unsigned char*>(shared_hex), strlen(shared_hex), aes_key.data());
+    OPENSSL_free(shared_hex);
+    
+    const int NONCE_LEN = 12;
+    unsigned char nonce[NONCE_LEN];
+    memset(nonce, 0, NONCE_LEN);
+    
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), nullptr, aes_key.data(), nonce);
+    
+    std::vector<unsigned char> ciphertext(plaintext_bytes.size());
+    int len = 0;
+    EVP_EncryptUpdate(ctx, ciphertext.data(), &len, plaintext_bytes.data(), plaintext_bytes.size());
+    EVP_CIPHER_CTX_free(ctx);
+    
+    char* ephemeral_pk_hex = EC_POINT_point2hex(current_params_->group, ephemeral_pk,
+                                                 POINT_CONVERSION_COMPRESSED, current_params_->ctx);
+    std::string result;
+    result.append(ephemeral_pk_hex);
+    result.append(reinterpret_cast<char*>(nonce), NONCE_LEN);
+    result.append(reinterpret_cast<char*>(ciphertext.data()), len);
+    
+    OPENSSL_free(ephemeral_pk_hex);
+    EC_POINT_free(ephemeral_pk);
+    EC_POINT_free(shared_point);
+    BN_free(ephemeral_sk);
+    
+    return result;
+}
 
-SystemParams::SystemParams() 
-    : group(nullptr), P(nullptr), q(nullptr), ctx(nullptr) {}
+std::string EcoRedactSystem::ECIESDecrypt(const std::string& ciphertext, BIGNUM* private_key) {
+    if (!private_key || !current_params_ || !current_params_->group) {
+        std::cerr << "错误: ECIES解密参数无效" << std::endl;
+        return "";
+    }
+    
+    size_t ephemeral_pk_hex_len = 66;  // 压缩格式公钥的hex长度
+    if (ciphertext.length() < ephemeral_pk_hex_len + 12) {
+        std::cerr << "错误: 密文长度不足: " << ciphertext.length() << std::endl;
+        return "";
+    }
+    
+    std::string ephemeral_pk_hex = ciphertext.substr(0, ephemeral_pk_hex_len);
+    const unsigned char* nonce = reinterpret_cast<const unsigned char*>(ciphertext.data() + ephemeral_pk_hex_len);
+    size_t enc_len = ciphertext.length() - ephemeral_pk_hex_len - 12;
+    const unsigned char* enc_data = reinterpret_cast<const unsigned char*>(ciphertext.data() + ephemeral_pk_hex_len + 12);
+    
+    EC_POINT* ephemeral_pk = EC_POINT_new(current_params_->group);
+    EC_POINT* shared_point = EC_POINT_new(current_params_->group);
+    EC_POINT_mul(current_params_->group, shared_point, nullptr, ephemeral_pk, private_key, current_params_->ctx);
+    
+    char* shared_hex = EC_POINT_point2hex(current_params_->group, shared_point,
+                                           POINT_CONVERSION_COMPRESSED, current_params_->ctx);
+    if (!shared_hex) {
+        std::cerr << "错误: 无法计算共享密钥" << std::endl;
+        EC_POINT_free(ephemeral_pk);
+        EC_POINT_free(shared_point);
+        return "";
+    }
+    
+    std::vector<unsigned char> aes_key(32);
+    SHA256(reinterpret_cast<const unsigned char*>(shared_hex), strlen(shared_hex), aes_key.data());
+    OPENSSL_free(shared_hex);
+    
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), nullptr, aes_key.data(), nonce);
+    
+    std::vector<unsigned char> plaintext_bytes(enc_len);
+    int len = 0;
+    if (EVP_DecryptUpdate(ctx, plaintext_bytes.data(), &len, enc_data, enc_len) != 1) {
+        std::cerr << "错误: AES解密失败" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        EC_POINT_free(ephemeral_pk);
+        EC_POINT_free(shared_point);
+        return "";
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    
+    EC_POINT_free(ephemeral_pk);
+    EC_POINT_free(shared_point);
+    
+    // 将解密后的二进制数据转换为十六进制字符串
+    std::string result;
+    for (int i = 0; i < len; i++) {
+        char hex[3];
+        snprintf(hex, sizeof(hex), "%02X", plaintext_bytes[i]);
+        result += hex;
+    }
+    
+    // 验证结果是否为有效的十六进制
+    for (char c : result) {
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) {
+            std::cerr << "错误: 解密结果包含非十六进制字符: " << c << std::endl;
+            return "";
+        }
+    }
+    
+    return result;
+}
+
+// SystemParams 实现
+SystemParams::SystemParams() : group(nullptr), P(nullptr), q(nullptr), ctx(nullptr) {}
 
 SystemParams::~SystemParams() {
     if (P) EC_POINT_free(P);
@@ -178,14 +208,11 @@ SystemParams::~SystemParams() {
     if (ctx) BN_CTX_free(ctx);
 }
 
-// ==================== VehicleStorage 实现 ====================
-
+// VehicleStorage 实现
 VehicleStorage::VehicleStorage()
     : vsk(nullptr), vpk(nullptr), ask_root(nullptr), apk_root(nullptr), vapk_root(nullptr) {}
 
-VehicleStorage::~VehicleStorage() {
-    Clear();
-}
+VehicleStorage::~VehicleStorage() { Clear(); }
 
 void VehicleStorage::Clear() {
     if (vsk) { BN_free(vsk); vsk = nullptr; }
@@ -196,11 +223,12 @@ void VehicleStorage::Clear() {
 }
 
 bool VehicleStorage::SaveToFile(const std::string& dir) const {
+    std::filesystem::create_directories(dir);
     std::string filename = dir + "/vehicle_" + entity_id + ".key";
     std::ofstream file(filename);
     if (!file.is_open()) return false;
     
-    char* vsk_hex = BN_bn2hex(vsk);
+    char* vsk_hex = vsk ? BN_bn2hex(vsk) : strdup("0");
     char* ask_hex = ask_root ? BN_bn2hex(ask_root) : strdup("0");
     
     file << "# Vehicle Storage\n";
@@ -225,8 +253,10 @@ bool VehicleStorage::LoadFromFile(const std::string& dir, const std::string& id)
     std::string line;
     while (std::getline(file, line)) {
         if (line.find("vsk=") == 0) {
+            if (vsk) BN_free(vsk);
             BN_hex2bn(&vsk, line.substr(4).c_str());
         } else if (line.find("ask_root=") == 0) {
+            if (ask_root) BN_free(ask_root);
             BN_hex2bn(&ask_root, line.substr(9).c_str());
         } else if (line.find("deri_root=") == 0) {
             deri_root = line.substr(10);
@@ -242,13 +272,11 @@ bool VehicleStorage::LoadFromFile(const std::string& dir, const std::string& id)
     return true;
 }
 
-// ==================== ManagerStorage 实现 ====================
+// ManagerStorage 实现
 ManagerStorage::ManagerStorage()
     : msk(nullptr), mpk(nullptr), committed_space(0), last_quality(0.0), random_x(nullptr) {}
 
-ManagerStorage::~ManagerStorage() {
-    Clear();
-}
+ManagerStorage::~ManagerStorage() { Clear(); }
 
 void ManagerStorage::Clear() {
     if (msk) { BN_free(msk); msk = nullptr; }
@@ -257,11 +285,12 @@ void ManagerStorage::Clear() {
 }
 
 bool ManagerStorage::SaveToFile(const std::string& dir) const {
+    std::filesystem::create_directories(dir);
     std::string filename = dir + "/manager_" + entity_id + ".key";
     std::ofstream file(filename);
     if (!file.is_open()) return false;
     
-    char* msk_hex = BN_bn2hex(msk);
+    char* msk_hex = msk ? BN_bn2hex(msk) : strdup("0");
     char* random_hex = random_x ? BN_bn2hex(random_x) : strdup("0");
     
     file << "# Manager Storage\n";
@@ -269,6 +298,8 @@ bool ManagerStorage::SaveToFile(const std::string& dir) const {
     file << "msk=" << msk_hex << "\n";
     file << "committed_space=" << committed_space << "\n";
     file << "random_x=" << random_hex << "\n";
+    
+    //std::cout << "    保存 " << entity_id << ": random_x=" << random_hex << std::endl;
     
     OPENSSL_free(msk_hex);
     OPENSSL_free(random_hex);
@@ -294,6 +325,8 @@ bool ManagerStorage::LoadFromFile(const std::string& dir, const std::string& id)
             std::string hex_str = line.substr(9);
             if (random_x) BN_free(random_x);
             BN_hex2bn(&random_x, hex_str.c_str());
+            // 调试输出
+            std::cout << "    加载 " << id << ": random_x=" << hex_str << std::endl;
         } else if (line.find("committed_space=") == 0) {
             committed_space = std::stoi(line.substr(16));
         } else if (line.find("entity_id=") == 0) {
@@ -301,23 +334,13 @@ bool ManagerStorage::LoadFromFile(const std::string& dir, const std::string& id)
         }
     }
     file.close();
-    
-    // 验证加载是否成功
-    if (!random_x) {
-        std::cerr << "错误: 加载管理员 " << id << " 的 random_x 失败" << std::endl;
-        return false;
-    }
-    
     return true;
 }
 
-// ==================== RSUStorage 实现 ====================
-
+// RSUStorage 实现
 RSUStorage::RSUStorage() : rsk(nullptr), rpk(nullptr) {}
 
-RSUStorage::~RSUStorage() {
-    Clear();
-}
+RSUStorage::~RSUStorage() { Clear(); }
 
 void RSUStorage::Clear() {
     if (rsk) { BN_free(rsk); rsk = nullptr; }
@@ -325,11 +348,12 @@ void RSUStorage::Clear() {
 }
 
 bool RSUStorage::SaveToFile(const std::string& dir) const {
+    std::filesystem::create_directories(dir);
     std::string filename = dir + "/rsu_" + entity_id + ".key";
     std::ofstream file(filename);
     if (!file.is_open()) return false;
     
-    char* rsk_hex = BN_bn2hex(rsk);
+    char* rsk_hex = rsk ? BN_bn2hex(rsk) : strdup("0");
     file << "# RSU Storage\n";
     file << "entity_id=" << entity_id << "\n";
     file << "rsk=" << rsk_hex << "\n";
@@ -355,8 +379,7 @@ bool RSUStorage::LoadFromFile(const std::string& dir, const std::string& id) {
     return true;
 }
 
-// ==================== RegisterRequest 实现 ====================
-
+// RegisterRequest 实现
 RegisterRequest::RegisterRequest() : apk_root(nullptr), vapk_root(nullptr) {}
 
 RegisterRequest::~RegisterRequest() {
@@ -384,7 +407,6 @@ void RegisterRequest::BuildRequest(SystemParams* params,
                                     const std::string& certificate,
                                     BIGNUM* vsk,
                                     const std::string& aid) {
-    // ==================== 第一步：存储请求参数 ====================
     this->apk_root = EC_POINT_new(params->group);
     this->vapk_root = EC_POINT_new(params->group);
     EC_POINT_copy(this->apk_root, apk_root);
@@ -393,28 +415,22 @@ void RegisterRequest::BuildRequest(SystemParams* params,
     this->certificate = certificate;
     this->aid = aid;
     
-    // ==================== 第二步：构造待签名数据 ====================
     std::string apk_hex = PointToHex(params->group, apk_root);
     std::string vapk_hex = PointToHex(params->group, vapk_root);
-    std::string sign_data = apk_hex + "|" + vapk_hex;
+    std::string sign_data = apk_hex + "|" + vapk_hex + "|" + deri_root + "|" + aid;
     
-    // ==================== 第三步：创建ECDSA密钥对象并设置私钥 ====================
     EC_KEY* eckey = EC_KEY_new();
     EC_KEY_set_group(eckey, params->group);
-    // 设置私钥
     EC_KEY_set_private_key(eckey, vsk);
     
-    // ==================== 第四步：计算签名 ====================
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(sign_data.c_str()), sign_data.length(), hash);
     ECDSA_SIG* sig = ECDSA_do_sign(hash, SHA256_DIGEST_LENGTH, eckey);
     
-    // ==================== 第五步：签名编码 ====================
     unsigned char* der = nullptr;
     int der_len = i2d_ECDSA_SIG(sig, &der);
     this->signature = BytesToHexStringStatic(der, der_len);
     
-    // ==================== 第六步：清理资源 ====================
     OPENSSL_free(der);
     ECDSA_SIG_free(sig);
     EC_KEY_free(eckey);
@@ -431,7 +447,7 @@ bool RegisterRequest::Verify(SystemParams* params, EC_POINT* vpk, BIGNUM* msk) c
     
     std::string apk_hex = PointToHex(params->group, this->apk_root);
     std::string vapk_hex = PointToHex(params->group, this->vapk_root);
-    std::string sign_data = apk_hex + "|" + vapk_hex;
+    std::string sign_data = apk_hex + "|" + vapk_hex + "|" + deri_root + "|" + aid;
     
     EC_KEY* eckey = EC_KEY_new();
     EC_KEY_set_group(eckey, params->group);
@@ -458,7 +474,6 @@ bool RegisterRequest::Verify(SystemParams* params, EC_POINT* vpk, BIGNUM* msk) c
         return false;
     }
     std::cout << "  [验证3/3] vapk等式: 成立" << std::endl;
-    
     std::cout << "   注册请求验证通过" << std::endl;
     return true;
 }
@@ -491,12 +506,10 @@ bool RegisterRequest::Deserialize(const std::string& data, SystemParams* params)
     this->vapk_root = EC_POINT_new(params->group);
     EC_POINT_hex2point(params->group, parts[4].c_str(), this->apk_root, params->ctx);
     EC_POINT_hex2point(params->group, parts[5].c_str(), this->vapk_root, params->ctx);
-    
     return true;
 }
 
-// ==================== SignatureOfKnowledge 实现 ====================
-
+// SignatureOfKnowledge 实现
 SignatureOfKnowledge::SignatureOfKnowledge() 
     : Pr1(nullptr), Pr2(nullptr), Ch(nullptr), Rp1(nullptr), Rp2(nullptr) {}
 
@@ -508,16 +521,14 @@ SignatureOfKnowledge::~SignatureOfKnowledge() {
     if (Rp2) BN_free(Rp2);
 }
 
-// ==================== PeriodProof 实现 ====================
-
+// PeriodProof 实现
 std::string PeriodProof::ToString() const {
     std::stringstream ss;
     ss << h_commit << "|" << valid_until << "|" << rsu_signature;
     return ss.str();
 }
 
-// ==================== VehicleMessage 实现 ====================
-
+// VehicleMessage 实现
 VehicleMessage::VehicleMessage() : apk(nullptr), vapk(nullptr) {}
 
 VehicleMessage::~VehicleMessage() {
@@ -525,10 +536,8 @@ VehicleMessage::~VehicleMessage() {
     if (vapk) EC_POINT_free(vapk);
 }
 
-// ==================== EcoRedactSystem 实现 ====================
-
-EcoRedactSystem::EcoRedactSystem() 
-    : current_params_(nullptr), blockchain_(nullptr) {
+// EcoRedactSystem 实现
+EcoRedactSystem::EcoRedactSystem() : current_params_(nullptr), blockchain_(nullptr) {
     if (!std::filesystem::exists(key_dir_)) {
         std::filesystem::create_directories(key_dir_);
     }
@@ -537,15 +546,22 @@ EcoRedactSystem::EcoRedactSystem()
 }
 
 EcoRedactSystem::~EcoRedactSystem() {
-    if (current_params_) delete current_params_;
     if (blockchain_) {
         blockchain_->SaveToFile();
         delete blockchain_;
+        blockchain_ = nullptr;
+    }
+    if (current_params_) {
+        if (current_params_->ctx) BN_CTX_free(current_params_->ctx);
+        if (current_params_->q) BN_free(current_params_->q);
+        if (current_params_->group) EC_GROUP_free(current_params_->group);
+        current_params_->P = nullptr;
+        delete current_params_;
+        current_params_ = nullptr;
     }
 }
 
-// ==================== 辅助函数 ====================
-
+// 辅助函数
 std::string EcoRedactSystem::BytesToHexString(const unsigned char* bytes, size_t len) {
     return BytesToHexStringStatic(bytes, len);
 }
@@ -569,78 +585,119 @@ std::vector<uint8_t> EcoRedactSystem::HexToBytes(const std::string& hex) {
     return HexToBytesStatic(hex);
 }
 
-// ==================== 机动因子管理实现 ====================
+void EcoRedactSystem::UpdateManagerRankings(const std::vector<std::pair<std::string, double>>& qualities) {
+    for (size_t i = 0; i < qualities.size() && i < all_managers_.size(); i++) {
+        for (auto* m : all_managers_) {
+            if (m->entity_id == qualities[i].first) {
+                m->last_quality = qualities[i].second;
+                break;
+            }
+        }
+    }
+}
 
-// ==================== 辅助异或函数 ====================
-
-std::string EcoRedactSystem::GenerateMobilityFactor(
-    const std::vector<ManagerStorage*>& managers) {
-    
-    std::string G_encrypted;
+// 机动因子生成
+std::string EcoRedactSystem::GenerateMobilityFactor(const std::vector<ManagerStorage*>& managers) {
+    std::string F_encrypted;
     
     for (auto* manager : managers) {
+        if (!manager->random_x) {
+            std::cerr << "错误: 管理员 " << manager->entity_id << " 没有随机数" << std::endl;
+            continue;
+        }
+        
         char* random_hex = BN_bn2hex(manager->random_x);
         std::string random_str(random_hex);
         OPENSSL_free(random_hex);
         
-        // 每个管理员用自己的公钥加密自己的随机数
-        std::string encrypted = EncryptWithManagerKey(random_str, manager->mpk);
-        G_encrypted += encrypted;
+        // random_str 是十六进制字符串，ECIESEncrypt 会将其转换为二进制再加密
+        std::string encrypted = ECIESEncrypt(random_str, manager->mpk);
+        F_encrypted += encrypted;
     }
     
-    return G_encrypted;
+    return F_encrypted;
 }
 
-std::string EcoRedactSystem::UpdateAllManagersRandomNumbers(
+// 安全的密文更新
+std::string EcoRedactSystem::UpdateAllManagersRandomNumbersSafe(
     const std::vector<ManagerStorage*>& managers,
     const std::string& old_txs_hash,
-    const std::string& old_G_encrypted,
+    const std::string& old_F_encrypted,
     const std::string& new_txs_hash) {
     
     size_t num_managers = managers.size();
-    size_t slice_len = old_G_encrypted.length() / num_managers;
-    
-    // ==================== 第一步：计算新密文（直接对密文异或）====================
-    std::string new_G_encrypted = XorStringsInternal(old_txs_hash, old_G_encrypted);
-    new_G_encrypted = XorStringsInternal(new_G_encrypted, new_txs_hash);
-    
-    // ==================== 第二步：分割并解密得到新随机数 ====================
-    for (size_t i = 0; i < num_managers; i++) {
-        std::string encrypted_slice = new_G_encrypted.substr(i * slice_len, slice_len);
-        
-        // 用自己的私钥解密，得到新的随机数
-        std::string new_random = DecryptWithManagerKey(encrypted_slice, managers[i]->msk);
-        
-        if (new_random.empty()) {
-            std::cerr << "错误: 管理员 " << managers[i]->entity_id << " 解密失败!" << std::endl;
-            return "";
-        }
-        
-        // 更新随机数
-        BN_free(managers[i]->random_x);
-        managers[i]->random_x = BN_new();
-        BN_hex2bn(&managers[i]->random_x, new_random.c_str());
-        managers[i]->SaveToFile(key_dir_);
-        
-    }
-    
-    // ==================== 第三步：验证核心不变性 ====================
-    std::string old_xor = XorStringsInternal(old_txs_hash, old_G_encrypted);
-    std::string new_xor = XorStringsInternal(new_txs_hash, new_G_encrypted);
-    
-    if (old_xor != new_xor) {
-        std::cerr << "错误: 密文异或值不匹配!" << std::endl;
+    if (num_managers == 0) {
+        std::cerr << "错误: 管理员列表为空" << std::endl;
         return "";
     }
     
-    std::cout << "正确：密文异或值验证通过！" << std::endl;
+    size_t total_enc_len = old_F_encrypted.length();
+    size_t slice_len = total_enc_len / num_managers;
+    if (slice_len == 0) {
+        std::cerr << "错误: 分片长度为0" << std::endl;
+        return "";
+    }
     
-    return new_G_encrypted;
+    std::string old_hash_extended = ExtendHashToLength(old_txs_hash, slice_len);
+    std::string new_hash_extended = ExtendHashToLength(new_txs_hash, slice_len);
+    
+    std::string new_F_encrypted;
+    for (size_t i = 0; i < num_managers; i++) {
+        std::string old_slice = old_F_encrypted.substr(i * slice_len, slice_len);
+        std::string new_slice = XorStringsInternal(old_slice, old_hash_extended);
+        new_slice = XorStringsInternal(new_slice, new_hash_extended);
+        
+        if (new_slice.length() < slice_len) new_slice.resize(slice_len, 0);
+        else if (new_slice.length() > slice_len) new_slice = new_slice.substr(0, slice_len);
+        
+        new_F_encrypted += new_slice;
+        
+        // 解密获取新的随机数并更新
+        std::string new_random = ECIESDecrypt(new_slice, managers[i]->msk);
+        if (!new_random.empty() && new_random != "0") {
+            BN_free(managers[i]->random_x);
+            managers[i]->random_x = BN_new();
+            
+            if (BN_hex2bn(&managers[i]->random_x, new_random.c_str()) != 0) {
+                // 验证更新后的随机数不为零
+                if (BN_is_zero(managers[i]->random_x)) {
+                    std::cerr << "  警告: 管理员 " << managers[i]->entity_id << " 随机数无效，重新生成" << std::endl;
+                    BN_rand_range(managers[i]->random_x, current_params_->q);
+                    while (BN_is_zero(managers[i]->random_x)) {
+                        BN_rand_range(managers[i]->random_x, current_params_->q);
+                    }
+                }
+                managers[i]->SaveToFile(key_dir_);
+            } else {
+                std::cerr << "  警告: 管理员 " << managers[i]->entity_id << " BN_hex2bn 失败" << std::endl;
+            }
+        } else {
+            std::cerr << "  警告: 管理员 " << managers[i]->entity_id << " 解密失败" << std::endl;
+        }
+    }
+    
+    std::string old_hash_verify = ExtendHashToLength(old_txs_hash, old_F_encrypted.length());
+    std::string new_hash_verify = ExtendHashToLength(new_txs_hash, new_F_encrypted.length());
+    
+    std::string old_xor = XorStringsInternal(old_hash_verify, old_F_encrypted);
+    std::string new_xor = XorStringsInternal(new_hash_verify, new_F_encrypted);
+    
+    if (ComputeSHA256String(old_xor) != ComputeSHA256String(new_xor)) {
+        std::cerr << "错误: 核心不变性验证失败!" << std::endl;
+        return "";
+    }
+    
+    std::cout << "正确：核心不变性验证通过！" << std::endl;
+    return new_F_encrypted;
 }
 
-// ==================== 阶段一: 系统初始化 ====================
-
+// 阶段一: 系统初始化
 SystemParams* EcoRedactSystem::Setup(int curve_nid) {
+    // 初始化 OpenSSL 随机数生成器
+    unsigned char seed[32];
+    RAND_bytes(seed, sizeof(seed));
+    RAND_seed(seed, sizeof(seed));
+
     std::cout << "\n========================================" << std::endl;
     std::cout << "  Setup - 初始化系统参数" << std::endl;
     std::cout << "========================================" << std::endl;
@@ -657,9 +714,9 @@ SystemParams* EcoRedactSystem::Setup(int curve_nid) {
     return current_params_;
 }
 
+// 实体创建
 VehicleStorage* EcoRedactSystem::CreateVehicle(const std::string& vehicle_id) {
     std::cout << "  创建车辆: " << vehicle_id << std::endl;
-    
     VehicleStorage* v = new VehicleStorage();
     v->entity_id = vehicle_id;
     v->vsk = BN_new();
@@ -671,7 +728,6 @@ VehicleStorage* EcoRedactSystem::CreateVehicle(const std::string& vehicle_id) {
     auto ts = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     v->certificate = vehicle_id + "|" + pk_hex + "|" + std::to_string(ts) + "|CA_SIG";
-    
     v->SaveToFile(key_dir_);
     return v;
 }
@@ -683,97 +739,117 @@ ManagerStorage* EcoRedactSystem::CreateManager(const std::string& manager_id, in
     m->entity_id = manager_id;
     m->committed_space = committed_space;
     
-    // 生成私钥
+    // 生成管理员私钥
     m->msk = BN_new();
-    do { BN_rand_range(m->msk, current_params_->q); } while (BN_is_zero(m->msk));
+    do { 
+        BN_rand_range(m->msk, current_params_->q); 
+    } while (BN_is_zero(m->msk));
     
-    // 生成公钥
     m->mpk = EC_POINT_new(current_params_->group);
     EC_POINT_mul(current_params_->group, m->mpk, m->msk, nullptr, nullptr, current_params_->ctx);
     
-    // 生成随机数
+    // 生成专属随机数 x_i
     m->random_x = BN_new();
-    BN_rand_range(m->random_x, current_params_->q);
+    do {
+        BN_rand_range(m->random_x, current_params_->q);
+    } while (BN_is_zero(m->random_x));
     
     // 调试输出
     char* random_hex = BN_bn2hex(m->random_x);
+    //std::cout << "    生成随机数: " << random_hex << std::endl;
     OPENSSL_free(random_hex);
     
-    // 保存到文件
     bool saved = m->SaveToFile(key_dir_);
     if (!saved) {
         std::cerr << "  警告: 保存管理员 " << manager_id << " 到文件失败" << std::endl;
+    } else {
+        //std::cout << "    已保存到文件" << std::endl;
     }
     
-    // 添加到管理员列表
     all_managers_.push_back(m);
-    
     return m;
 }
 
 RSUStorage* EcoRedactSystem::CreateRSU(const std::string& rsu_id) {
     std::cout << "  创建 RSU: " << rsu_id << std::endl;
-    
     RSUStorage* r = new RSUStorage();
     r->entity_id = rsu_id;
     r->rsk = BN_new();
     do { BN_rand_range(r->rsk, current_params_->q); } while (BN_is_zero(r->rsk));
     r->rpk = EC_POINT_new(current_params_->group);
     EC_POINT_mul(current_params_->group, r->rpk, r->rsk, nullptr, nullptr, current_params_->ctx);
-    
     r->SaveToFile(key_dir_);
     return r;
 }
 
-// ==================== 阶段二: 匿名公钥上链 ====================
+VehicleStorage* EcoRedactSystem::LoadVehicle(const std::string& vehicle_id) {
+    VehicleStorage* v = new VehicleStorage();
+    if (v->LoadFromFile(key_dir_, vehicle_id)) return v;
+    delete v;
+    return nullptr;
+}
 
+ManagerStorage* EcoRedactSystem::LoadManager(const std::string& manager_id) {
+    ManagerStorage* m = new ManagerStorage();
+    if (m->LoadFromFile(key_dir_, manager_id)) return m;
+    delete m;
+    return nullptr;
+}
+
+RSUStorage* EcoRedactSystem::LoadRSU(const std::string& rsu_id) {
+    RSUStorage* r = new RSUStorage();
+    if (r->LoadFromFile(key_dir_, rsu_id)) return r;
+    delete r;
+    return nullptr;
+}
+
+// 阶段二: 空间证明竞争
 std::pair<ManagerStorage*, std::vector<std::pair<std::string, double>>> 
 EcoRedactSystem::PoSpaceRacing(std::vector<ManagerStorage*>& managers) {
     std::cout << "\n========================================" << std::endl;
     std::cout << "  PoSpaceRacing - 空间证明竞争" << std::endl;
     std::cout << "========================================" << std::endl;
-    
+
     std::vector<std::pair<std::string, double>> qualities;
     ManagerStorage* winner = nullptr;
     int max_space = 0;
     
     for (auto* m : managers) {
-        double quality = 1.0 / (m->committed_space + 1.0);
+        double quality = static_cast<double>(m->committed_space) / 100.0;
+        if (quality > 1.0) quality = 1.0;
         m->last_quality = quality;
         qualities.push_back({m->entity_id, quality});
-        
-        std::cout << "  管理员 " << m->entity_id 
-                  << ": 空间 = " << m->committed_space << " MB"
-                  << ", 质量 = " << quality << std::endl;
-        
-        // 空间越大，质量值越小，越容易获胜
+        std::cout << "  管理员 " << m->entity_id << ": 空间 = " << m->committed_space << " MB " << std::endl;
         if (m->committed_space > max_space) {
             max_space = m->committed_space;
             winner = m;
         }
     }
     
-    std::cout << "\n  获胜管理员: " << winner->entity_id 
-              << " (空间: " << winner->committed_space << " MB)" << std::endl;
+    std::sort(qualities.begin(), qualities.end(),
+              [](const std::pair<std::string, double>& a, const std::pair<std::string, double>& b) {
+                  return a.second > b.second;
+              });
     
+    std::cout << "\n  获胜管理员: " << winner->entity_id 
+              << " (空间: " << winner->committed_space << " MB " << ")" << std::endl;
     return {winner, qualities};
 }
 
-
 void EcoRedactSystem::GenerateRootKey(SystemParams* params, VehicleStorage* vehicle, EC_POINT* mpk) {
-    // ==================== 第一步：HMAC-SHA512 派生 ====================
-    std::string key = "VehicleAnonymousKey";
-    std::string pseed = "ROOT_SEED_" + vehicle->entity_id; 
+    std::string key = "VehicleAnonymousKey_" + vehicle->entity_id;
+    unsigned char seed[32];
+    RAND_bytes(seed, sizeof(seed));
+    std::string pseed = BytesToHexStringStatic(seed, sizeof(seed));
     std::string hmac_result = HMAC_SHA512(key, pseed);
+    
     std::string I_L_hex = hmac_result.substr(0, 64);
     std::string I_R_hex = hmac_result.substr(64, 64);
     
-    // ==================== 第二步：生成根匿名私钥 ask_root ====================
     vehicle->ask_root = BN_new();
     BN_hex2bn(&vehicle->ask_root, I_L_hex.c_str());
     BN_mod(vehicle->ask_root, vehicle->ask_root, params->q, params->ctx);
     
-    // ==================== 第三步：生成根派生信息 deri_root ====================
     BIGNUM* I_R = BN_new();
     BN_hex2bn(&I_R, I_R_hex.c_str());
     BN_mod(I_R, I_R, params->q, params->ctx);
@@ -782,22 +858,14 @@ void EcoRedactSystem::GenerateRootKey(SystemParams* params, VehicleStorage* vehi
     OPENSSL_free(I_R_hex_mod);
     BN_free(I_R);
     
-    // ==================== 第四步：计算根匿名公钥 apk_root ====================
     vehicle->apk_root = EC_POINT_new(params->group);
-    EC_POINT_mul(params->group, vehicle->apk_root, vehicle->ask_root, 
-                 nullptr, nullptr, params->ctx);
-    
-    // ==================== 第五步：计算条件验证公钥 vapk_root ====================
+    EC_POINT_mul(params->group, vehicle->apk_root, vehicle->ask_root, nullptr, nullptr, params->ctx);
     vehicle->vapk_root = ComputeVAPK(params, vehicle->vpk, vehicle->ask_root, mpk);
     
-    // ==================== 第六步：计算匿名身份标识 AID ====================
     std::string apk_hex = PointToHex(params->group, vehicle->apk_root);
     std::string aid_input = apk_hex + key;
-    
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(aid_input.c_str()), 
-           aid_input.length(), hash);
-    
+    SHA256(reinterpret_cast<const unsigned char*>(aid_input.c_str()), aid_input.length(), hash);
     vehicle->aid = BytesToHexString(hash, SHA256_DIGEST_LENGTH).substr(0, 32);
 }
 
@@ -808,6 +876,13 @@ RegisterRequest EcoRedactSystem::BuildRegisterRequest(SystemParams* params, Vehi
                      vehicle->deri_root, vehicle->certificate,
                      vehicle->vsk, vehicle->aid);
     return req;
+}
+
+std::string EcoRedactSystem::ExtendHashToLength(const std::string& hash, size_t target_len) {
+    if (hash.length() >= target_len) return hash.substr(0, target_len);
+    std::string result;
+    while (result.length() < target_len) result += hash;
+    return result.substr(0, target_len);
 }
 
 bool EcoRedactSystem::ProcessRegisterRequest(SystemParams* params, const RegisterRequest& req,
@@ -837,19 +912,18 @@ bool EcoRedactSystem::ProcessRegisterRequest(SystemParams* params, const Registe
     tx.tx_id = "TX_" + req.aid.substr(0, 16);
     tx.aid = req.aid;
     tx.root_apk = PointToHex(params->group, req.apk_root);
-    tx.deri_info = req.deri_root;
     tx.register_time = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
     int new_height = blockchain_->GetLatestHeight() + 1;
     Block* prev_block = blockchain_->GetBlock(new_height - 1);
+    std::vector<ManagerStorage*> all_managers = all_managers_;
     
     Block new_block;
     new_block.height = new_height;
     new_block.timestamp = tx.register_time;
     new_block.transactions.push_back(tx);
     
-    // 设置证明子块
     new_block.proof.index = new_height;
     new_block.proof.signature_on_prev = prev_block ? prev_block->proof.ComputeHash() : "GENESIS";
     new_block.proof.manager_id = manager->entity_id;
@@ -858,22 +932,20 @@ bool EcoRedactSystem::ProcessRegisterRequest(SystemParams* params, const Registe
     new_block.proof.quality = manager->last_quality;
     new_block.proof.timestamp = new_block.timestamp;
     
-    // ==================== 生成机动因子（密文拼接）====================
-    std::string G_encrypted = GenerateMobilityFactor(all_managers_);
+    std::string F_encrypted = GenerateMobilityFactor(all_managers);
     std::string txs_hash = new_block.ComputeTransactionsHash();
-    std::string xor_value = XorStringsInternal(txs_hash, G_encrypted);
+    std::string extended_hash = ExtendHashToLength(txs_hash, F_encrypted.length());
+    std::string xor_value = XorStringsInternal(extended_hash, F_encrypted);
     std::string xor_signature = ComputeSHA256String(xor_value);
     
     new_block.signature.index = new_height;
     new_block.signature.manager_id = manager->entity_id;
-    new_block.signature.xor_signature = xor_signature;   // 存储签名
+    new_block.signature.xor_signature = xor_signature;
     new_block.signature.signature_on_prev = prev_block ? prev_block->signature.ComputeHash() : "GENESIS";
     new_block.signature.public_key = PointToHex(params->group, manager->mpk);
-
     new_block.proof_hash = new_block.ComputeProofHash();
     
     bool success = blockchain_->AddBlock(new_block);
-    
     if (success) {
         std::cout << "  注册成功, AID: " << req.aid.substr(0, 32) << "..." << std::endl;
     } else {
@@ -884,8 +956,7 @@ bool EcoRedactSystem::ProcessRegisterRequest(SystemParams* params, const Registe
     return success;
 }
 
-// ==================== 阶段三: 匿名通信 ====================
-
+// 阶段三: 匿名通信
 EC_POINT* EcoRedactSystem::GetRootAPKByAID(const std::string& aid) {
     TransactionSubBlock* tx = blockchain_->FindTransactionByAID(aid);
     if (!tx) return nullptr;
@@ -941,13 +1012,11 @@ EcoRedactSystem::DeriveKey(SystemParams* params, BIGNUM* prev_ask, const std::st
     BN_free(I_R);
     BN_free(apk_x);
     BN_free(apk_y);
-    
     return {ask_new, apk_new, vapk_new, deri_new};
 }
 
 std::tuple<BIGNUM*, EC_POINT*, EC_POINT*, std::string> 
-EcoRedactSystem::DeriveKeyFromRoot(SystemParams* params, VehicleStorage* vehicle,
-                                    int k, EC_POINT* mpk) {
+EcoRedactSystem::DeriveKeyFromRoot(SystemParams* params, VehicleStorage* vehicle, int k, EC_POINT* mpk) {
     BIGNUM* current_ask = BN_new();
     BN_copy(current_ask, vehicle->ask_root);
     std::string current_deri = vehicle->deri_root;
@@ -979,160 +1048,133 @@ EcoRedactSystem::DeriveKeyFromRoot(SystemParams* params, VehicleStorage* vehicle
     return {final_ask, final_apk, final_vapk, final_deri};
 }
 
-
 PeriodProof EcoRedactSystem::PeriodProofGen(RSUStorage* rsu, const std::string& aid,
                                              EC_POINT* apk, int key_index, int duration) {
     PeriodProof proof;
-    
-    // ==================== 第一步：计算承诺值 h_commit ====================
     std::string apk_hex = PointToHex(current_params_->group, apk);
-    std::string commit_data = apk_hex + "|" + std::to_string(key_index);
-    
+    std::string commit_data = apk_hex + "|" + std::to_string(key_index) + "|" + aid;
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(commit_data.c_str()), 
-           commit_data.length(), hash);
-    proof.h_commit = BytesToHexString(hash, SHA256_DIGEST_LENGTH);
+    SHA256(reinterpret_cast<const unsigned char*>(commit_data.c_str()), commit_data.length(), hash);
+    proof.h_commit = BytesToHexStringStatic(hash, SHA256_DIGEST_LENGTH);
     
-    // ==================== 第二步：设置有效期 ====================
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     proof.valid_until = now + duration;
     
-    // ==================== 第三步：RSU 使用私钥进行 ECDSA 签名 ====================
     std::string sign_data = std::to_string(proof.valid_until) + "|" + proof.h_commit;
-    
-    SHA256(reinterpret_cast<const unsigned char*>(sign_data.c_str()), 
-           sign_data.length(), hash);
+    SHA256(reinterpret_cast<const unsigned char*>(sign_data.c_str()), sign_data.length(), hash);
     
     EC_KEY* eckey = EC_KEY_new();
+    if (!eckey) return proof;
     EC_KEY_set_group(eckey, current_params_->group);
     EC_KEY_set_private_key(eckey, rsu->rsk);
-
     ECDSA_SIG* sig = ECDSA_do_sign(hash, SHA256_DIGEST_LENGTH, eckey);
     
-    unsigned char* der = nullptr;
-    int der_len = i2d_ECDSA_SIG(sig, &der);
-    proof.rsu_signature = BytesToHexString(der, der_len);
-
-    OPENSSL_free(der);
-    ECDSA_SIG_free(sig);
+    if (sig) {
+        unsigned char* der = nullptr;
+        int der_len = i2d_ECDSA_SIG(sig, &der);
+        if (der_len > 0 && der) {
+            proof.rsu_signature = BytesToHexStringStatic(der, der_len);
+            OPENSSL_free(der);
+        }
+        ECDSA_SIG_free(sig);
+    }
     EC_KEY_free(eckey);
-    
     return proof;
 }
 
 bool EcoRedactSystem::PeriodProofVerify(const PeriodProof& proof, EC_POINT* rsu_pk) {
-    // 检查是否过期
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (static_cast<uint64_t>(now) > proof.valid_until) {
+        std::cout << "  周期证明已过期" << std::endl;
         return false;
     }
     
-    // 验证 RSU 签名
     std::string sign_data = std::to_string(proof.valid_until) + "|" + proof.h_commit;
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(sign_data.c_str()), 
-           sign_data.length(), hash);
+    SHA256(reinterpret_cast<const unsigned char*>(sign_data.c_str()), sign_data.length(), hash);
     
     EC_KEY* eckey = EC_KEY_new();
+    if (!eckey) return false;
     EC_KEY_set_group(eckey, current_params_->group);
     EC_KEY_set_public_key(eckey, rsu_pk);
     
     std::vector<unsigned char> der_bytes = HexToBytes(proof.rsu_signature);
+    if (der_bytes.empty()) {
+        EC_KEY_free(eckey);
+        return false;
+    }
     const unsigned char* der_ptr = der_bytes.data();
     ECDSA_SIG* sig = d2i_ECDSA_SIG(nullptr, &der_ptr, der_bytes.size());
-    
-    // 验证签名
+    if (!sig) {
+        EC_KEY_free(eckey);
+        return false;
+    }
     int result = ECDSA_do_verify(hash, SHA256_DIGEST_LENGTH, sig, eckey);
-    
-    // 清理资源
     ECDSA_SIG_free(sig);
     EC_KEY_free(eckey);
-    
     return (result == 1);
 }
 
-
 SignatureOfKnowledge EcoRedactSystem::SoKGen(SystemParams* params, const std::string& msg,
                                               BIGNUM* ask, BIGNUM* vsk, EC_POINT* apk,
-                                              EC_POINT* vpk, EC_POINT* mpk, const PeriodProof& proof) {
-    
+                                              EC_POINT* vpk, EC_POINT* mpk, 
+                                              const PeriodProof& proof) {
     SignatureOfKnowledge sig;
-    
-    // ==================== 第一步：初始化签名结构体中的点 ====================
     sig.Pr1 = EC_POINT_new(params->group);
     sig.Pr2 = EC_POINT_new(params->group);
-    
     sig.Ch = BN_new();
     sig.Rp1 = BN_new();
     sig.Rp2 = BN_new();
     
-    // ==================== 第二步：生成随机数 r1, r2 ====================
     BIGNUM* r1 = BN_new();
     BIGNUM* r2 = BN_new();
     BN_rand_range(r1, params->q);
     BN_rand_range(r2, params->q);
-    // 确保非零
     while (BN_is_zero(r1)) BN_rand_range(r1, params->q);
     while (BN_is_zero(r2)) BN_rand_range(r2, params->q);
     
-    // ==================== 第三步：计算承诺 Pr1 ====================
     EC_POINT_mul(params->group, sig.Pr1, r1, nullptr, nullptr, params->ctx);
     
-    // ==================== 第四步：计算承诺 Pr2 ====================
     EC_POINT* r2P = EC_POINT_new(params->group);
-    EC_POINT_mul(params->group, r2P, r2, nullptr, nullptr, params->ctx);  // r2·P
-    
+    EC_POINT_mul(params->group, r2P, r2, nullptr, nullptr, params->ctx);
     EC_POINT* r1Mpk = EC_POINT_new(params->group);
-    EC_POINT_mul(params->group, r1Mpk, nullptr, mpk, r1, params->ctx);    // r1·mpk
+    EC_POINT_mul(params->group, r1Mpk, nullptr, mpk, r1, params->ctx);
+    EC_POINT_add(params->group, sig.Pr2, r2P, r1Mpk, params->ctx);
     
-    EC_POINT_add(params->group, sig.Pr2, r2P, r1Mpk, params->ctx);        // r2·P + r1·mpk
-    
-    // ==================== 第五步：计算条件验证公钥 vapk ====================
     EC_POINT* vapk = ComputeVAPK(params, vpk, ask, mpk);
     
-    // ==================== 第六步：构造挑战数据 ====================
     std::string Pr1_hex = PointToHex(params->group, sig.Pr1);
     std::string Pr2_hex = PointToHex(params->group, sig.Pr2);
     std::string P_hex = PointToHex(params->group, params->P);
     std::string apk_hex = PointToHex(params->group, apk);
     std::string vapk_hex = PointToHex(params->group, vapk);
     std::string mpk_hex = PointToHex(params->group, mpk);
+    std::string proof_str = proof.ToString();
     
-    std::string timestamp = std::to_string(
+    sig.timestamp = std::to_string(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
     
-    // 挑战数据 = 消息 || Pr1 || Pr2 || P || apk || vapk || mpk || 时间戳 || 周期证明
     std::string challenge_data = msg + "|" + Pr1_hex + "|" + Pr2_hex + "|" + P_hex + "|" +
                                   apk_hex + "|" + vapk_hex + "|" + mpk_hex + "|" +
-                                  timestamp + "|" + proof.ToString();
+                                  sig.timestamp + "|" + proof_str;
     
-    // ==================== 第七步：计算挑战值 Ch ====================
-    // Ch = H(challenge_data) mod q
     unsigned char challenge_hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(challenge_data.c_str()), 
            challenge_data.length(), challenge_hash);
-    BN_hex2bn(&sig.Ch, BytesToHexString(challenge_hash, SHA256_DIGEST_LENGTH).c_str());
+    BN_hex2bn(&sig.Ch, BytesToHexStringStatic(challenge_hash, SHA256_DIGEST_LENGTH).c_str());
     BN_mod(sig.Ch, sig.Ch, params->q, params->ctx);
     
-    // ==================== 第八步：计算响应 Rp1 ====================
-    // Rp1 = r1 - ask · Ch (mod q)
     BIGNUM* ask_Ch = BN_new();
     BN_mod_mul(ask_Ch, ask, sig.Ch, params->q, params->ctx);
     BN_mod_sub(sig.Rp1, r1, ask_Ch, params->q, params->ctx);
     
-    // ==================== 第九步：计算响应 Rp2 ====================
-    // Rp2 = r2 - vsk · Ch (mod q)
     BIGNUM* vsk_Ch = BN_new();
     BN_mod_mul(vsk_Ch, vsk, sig.Ch, params->q, params->ctx);
     BN_mod_sub(sig.Rp2, r2, vsk_Ch, params->q, params->ctx);
     
-    // ==================== 第十步：存储时间戳 ====================
-    sig.timestamp = timestamp;
-    
-    // ==================== 第十一步：清理临时资源 ====================
     BN_free(r1);
     BN_free(r2);
     BN_free(ask_Ch);
@@ -1140,56 +1182,104 @@ SignatureOfKnowledge EcoRedactSystem::SoKGen(SystemParams* params, const std::st
     EC_POINT_free(r2P);
     EC_POINT_free(r1Mpk);
     EC_POINT_free(vapk);
-    
     return sig;
 }
 
-
 bool EcoRedactSystem::SoKVerify(SystemParams* params, const std::string& msg,
                                  const SignatureOfKnowledge& sig, EC_POINT* apk,
-                                 EC_POINT* vapk, EC_POINT* mpk, const PeriodProof& proof) {
+                                 EC_POINT* vapk, EC_POINT* mpk, 
+                                 const PeriodProof& proof, EC_POINT* rsu_pk) {
+    long long now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    long long ts = std::stoll(sig.timestamp);
     
-    // ==================== 第一步：计算 Rp1 + Rp2 (mod q) ====================
-    // rp1_plus_rp2 = (Rp1 + Rp2) mod q
+    if (std::abs(now - ts) > 60) {
+        std::cout << "  时间戳超出允许范围" << std::endl;
+        return false;
+    }
+    if (static_cast<uint64_t>(ts) > proof.valid_until) {
+        std::cout << "  时间戳超过周期证明有效期" << std::endl;
+        return false;
+    }
+    std::cout << "  时间戳有效" << std::endl;
+    
+    std::string sign_data = std::to_string(proof.valid_until) + "|" + proof.h_commit;
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(sign_data.c_str()), sign_data.length(), hash);
+    
+    EC_KEY* eckey = EC_KEY_new();
+    EC_KEY_set_group(eckey, params->group);
+    EC_KEY_set_public_key(eckey, rsu_pk);
+    std::vector<unsigned char> der_bytes = HexToBytes(proof.rsu_signature);
+    if (der_bytes.empty()) {
+        EC_KEY_free(eckey);
+        return false;
+    }
+    const unsigned char* der_ptr = der_bytes.data();
+    ECDSA_SIG* rsu_sig = d2i_ECDSA_SIG(nullptr, &der_ptr, der_bytes.size());
+    if (!rsu_sig) {
+        EC_KEY_free(eckey);
+        return false;
+    }
+    int verify_result = ECDSA_do_verify(hash, SHA256_DIGEST_LENGTH, rsu_sig, eckey);
+    ECDSA_SIG_free(rsu_sig);
+    EC_KEY_free(eckey);
+    if (verify_result != 1) {
+        std::cout << "  周期证明RSU签名无效" << std::endl;
+        return false;
+    }
+    std::cout << "  周期证明有效" << std::endl;
+    
+    std::string Pr1_hex = PointToHex(params->group, sig.Pr1);
+    std::string Pr2_hex = PointToHex(params->group, sig.Pr2);
+    std::string P_hex = PointToHex(params->group, params->P);
+    std::string apk_hex = PointToHex(params->group, apk);
+    std::string vapk_hex = PointToHex(params->group, vapk);
+    std::string mpk_hex = PointToHex(params->group, mpk);
+    std::string proof_str = proof.ToString();
+    
+    std::string challenge_data = msg + "|" + Pr1_hex + "|" + Pr2_hex + "|" + P_hex + "|" +
+                                  apk_hex + "|" + vapk_hex + "|" + mpk_hex + "|" +
+                                  sig.timestamp + "|" + proof_str;
+    
+    unsigned char challenge_hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(challenge_data.c_str()), 
+           challenge_data.length(), challenge_hash);
+    
+    BIGNUM* expected_ch = BN_new();
+    BN_hex2bn(&expected_ch, BytesToHexStringStatic(challenge_hash, SHA256_DIGEST_LENGTH).c_str());
+    BN_mod(expected_ch, expected_ch, params->q, params->ctx);
+    
+    if (BN_cmp(sig.Ch, expected_ch) != 0) {
+        BN_free(expected_ch);
+        std::cout << "  挑战值不匹配" << std::endl;
+        return false;
+    }
+    BN_free(expected_ch);
+    std::cout << "  挑战值匹配" << std::endl;
+    
     BIGNUM* rp1_plus_rp2 = BN_new();
     BN_add(rp1_plus_rp2, sig.Rp1, sig.Rp2);
     BN_mod(rp1_plus_rp2, rp1_plus_rp2, params->q, params->ctx);
     
-    // ==================== 第二步：计算左边 = Pr1 + Pr2 ====================
-    // left = Pr1 + Pr2
     EC_POINT* left = EC_POINT_new(params->group);
     EC_POINT_add(params->group, left, sig.Pr1, sig.Pr2, params->ctx);
     
-    // ==================== 第三步：计算右边各项 ====================
-    // right = (Rp1+Rp2)·P + Rp1·mpk + (apk+vapk)·Ch
     EC_POINT* right = EC_POINT_new(params->group);
-    
-    // 项1: term1 = (Rp1+Rp2) · P
     EC_POINT* term1 = EC_POINT_new(params->group);
     EC_POINT_mul(params->group, term1, rp1_plus_rp2, nullptr, nullptr, params->ctx);
-    
-    // 项2: term2 = Rp1 · mpk
     EC_POINT* term2 = EC_POINT_new(params->group);
     EC_POINT_mul(params->group, term2, nullptr, mpk, sig.Rp1, params->ctx);
-    
-    // 项3: term3 = (apk + vapk) · Ch
     EC_POINT* apk_plus_vapk = EC_POINT_new(params->group);
     EC_POINT_add(params->group, apk_plus_vapk, apk, vapk, params->ctx);
-    
     EC_POINT* term3 = EC_POINT_new(params->group);
     EC_POINT_mul(params->group, term3, nullptr, apk_plus_vapk, sig.Ch, params->ctx);
     
-    // ==================== 第四步：组合右边 = term1 + term2 + term3 ====================
-    // right = term1 + term2
     EC_POINT_add(params->group, right, term1, term2, params->ctx);
-    // right = (term1 + term2) + term3
     EC_POINT_add(params->group, right, right, term3, params->ctx);
     
-    // ==================== 第五步：比较左右两边 ====================
-    // EC_POINT_cmp 返回 0 表示两点相同
-    bool valid = (EC_POINT_cmp(params->group, left, right, params->ctx) == 0);
+    bool eq_valid = (EC_POINT_cmp(params->group, left, right, params->ctx) == 0);
     
-    // ==================== 第六步：清理临时资源 ====================
     BN_free(rp1_plus_rp2);
     EC_POINT_free(left);
     EC_POINT_free(right);
@@ -1198,16 +1288,22 @@ bool EcoRedactSystem::SoKVerify(SystemParams* params, const std::string& msg,
     EC_POINT_free(term3);
     EC_POINT_free(apk_plus_vapk);
     
-    return valid;
+    if (!eq_valid) {
+        std::cout << "  知识签名等式验证失败" << std::endl;
+        return false;
+    }
+    std::cout << "  知识签名等式验证通过" << std::endl;
+    return true;
 }
 
-// ==================== 车辆间通信模拟 ====================
-
 VehicleMessage EcoRedactSystem::SendMessage(SystemParams* params, const std::string& msg,
+                                             const std::string& aid,
                                              EC_POINT* apk, EC_POINT* vapk,
-                                             const SignatureOfKnowledge& sig, const PeriodProof& proof) {
+                                             const SignatureOfKnowledge& sig,
+                                             const PeriodProof& proof) {
     VehicleMessage vm;
     vm.msg = msg;
+    vm.aid = aid;
     vm.timestamp = sig.timestamp;
     vm.signature = sig;
     vm.period_proof = proof;
@@ -1224,34 +1320,48 @@ bool EcoRedactSystem::ReceiveAndVerify(SystemParams* params, const VehicleMessag
     std::cout << "  ReceiveAndVerify - 接收并验证消息" << std::endl;
     std::cout << "========================================" << std::endl;
     
-    if (!PeriodProofVerify(msg.period_proof, rsu_pk)) {
-        std::cout << "  消息拒绝: 周期证明无效" << std::endl;
-        return false;
-    }
-    std::cout << "  周期证明有效" << std::endl;
-    
-    long long now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    long long ts = std::stoll(msg.timestamp);
-    if (std::abs(now - ts) > 60) {
-        std::cout << "  消息拒绝: 时间戳过期" << std::endl;
-        return false;
-    }
-    std::cout << "  时间戳有效" << std::endl;
-    
-    bool sig_valid = SoKVerify(params, msg.msg, msg.signature, msg.apk, msg.vapk, mpk, msg.period_proof);
+    bool sig_valid = SoKVerify(params, msg.msg, msg.signature, 
+                                msg.apk, msg.vapk, mpk, 
+                                msg.period_proof, rsu_pk);
     if (!sig_valid) {
         std::cout << "  消息拒绝: 知识签名无效" << std::endl;
         return false;
     }
-    std::cout << "  知识签名有效" << std::endl;
-    
     std::cout << "  消息接受: 所有验证通过" << std::endl;
     return true;
 }
 
-// ==================== 阶段四: 匿名公钥撤销 ====================
+bool EcoRedactSystem::TraceVerify(const std::string& aid, EC_POINT* vpk, BIGNUM* msk) {
+    TransactionSubBlock* tx = blockchain_->FindTransactionByAID(aid);
+    if (!tx) {
+        std::cout << "  追溯失败: AID不存在或已被撤销" << std::endl;
+        return false;
+    }
+    std::cout << "  AID存在，注册时间: " << tx->register_time << std::endl;
+    
+    EC_POINT* apk_root = EC_POINT_new(current_params_->group);
+    if (EC_POINT_hex2point(current_params_->group, tx->root_apk.c_str(), 
+                            apk_root, current_params_->ctx) == nullptr) {
+        std::cout << "  追溯失败: 无法解析根匿名公钥" << std::endl;
+        EC_POINT_free(apk_root);
+        return false;
+    }
+    
+    EC_POINT* msk_apk = EC_POINT_new(current_params_->group);
+    EC_POINT_mul(current_params_->group, msk_apk, nullptr, apk_root, msk, current_params_->ctx);
+    
+    EC_POINT* computed_vapk = EC_POINT_new(current_params_->group);
+    EC_POINT_add(current_params_->group, computed_vapk, vpk, msk_apk, current_params_->ctx);
+    
+    std::string computed_vapk_hex = PointToHex(current_params_->group, computed_vapk);
+    
+    EC_POINT_free(apk_root);
+    EC_POINT_free(msk_apk);
+    EC_POINT_free(computed_vapk);
+    return true;
+}
 
+// 阶段四: 匿名公钥撤销
 bool EcoRedactSystem::AnonKeyRevoke(const std::string& aid, const std::string& reason,
                                      const std::vector<ManagerStorage*>& managers) {
     std::cout << "\n========================================" << std::endl;
@@ -1259,79 +1369,126 @@ bool EcoRedactSystem::AnonKeyRevoke(const std::string& aid, const std::string& r
     std::cout << "========================================" << std::endl;
     std::cout << "  撤销原因: " << reason << std::endl;
     
-    // ==================== 第一步：查找要撤销的AID ====================
-    TransactionSubBlock* tx = blockchain_->FindTransactionByAID(aid);
-    if (!tx) {
-        std::cout << "  撤销失败: AID不存在或已被撤销" << std::endl;
-        return false;
-    }
-    
-    // ==================== 第二步：获取包含该交易的区块 ====================
-    Block* target_block = nullptr;
+    int target_height = -1;
     const auto& chain = blockchain_->GetChain();
     for (size_t i = 0; i < chain.size(); i++) {
         if (chain[i].FindTransactionIndex(aid) != -1) {
-            target_block = const_cast<Block*>(&chain[i]);
+            target_height = static_cast<int>(i);
             break;
         }
     }
     
-    if (!target_block) {
+    if (target_height == -1) {
         std::cout << "  撤销失败: 无法找到包含该AID的区块" << std::endl;
         return false;
     }
     
-    // ==================== 第三步：获取旧数据 ====================
+    Block* target_block = blockchain_->GetBlock(target_height);
+    if (!target_block) return false;
+    std::cout << "  目标区块高度: " << target_height << std::endl;
+    
+    std::vector<ManagerStorage*> all_managers = all_managers_;
+    if (all_managers.empty()) all_managers = managers;
+    
+    // 计算旧交易哈希
     std::string old_txs_hash = target_block->ComputeTransactionsHash();
     
-    std::string old_G_encrypted = GenerateMobilityFactor(managers);
+    // 生成当前机动因子 F
+    std::string old_F = GenerateMobilityFactor(all_managers);
     
-    std::string old_xor = XorStringsInternal(old_txs_hash, old_G_encrypted);
-    std::string old_xor_hash = ComputeSHA256String(old_xor);
+    // 验证当前 F 是否正确
+    std::string extended_old_hash = ExtendHashToLength(old_txs_hash, old_F.length());
+    std::string computed_xor = XorStringsInternal(extended_old_hash, old_F);
+    std::string computed_sig = ComputeSHA256String(computed_xor);
+    std::string stored_sig = target_block->signature.xor_signature;
+    //std::cout << "  区块存储的签名: " << stored_sig << std::endl;
+    //std::cout << "  当前计算的签名: " << computed_sig << std::endl;
     
-    // ==================== 第四步：计算新交易哈希 ====================
-    std::vector<TransactionSubBlock> temp_transactions = target_block->transactions;
-    int tx_index = target_block->FindTransactionIndex(aid);
-    if (tx_index != -1) {
-        temp_transactions.erase(temp_transactions.begin() + tx_index);
+    if (computed_sig != stored_sig) {
+        std::cout << "  错误: 当前管理员的随机数与区块生成时不匹配！" << std::endl;
+        return false;
     }
     
+    // 创建新交易列表
+    std::vector<TransactionSubBlock> new_transactions;
+    for (const auto& tx : target_block->transactions) {
+        if (tx.aid != aid) new_transactions.push_back(tx);
+    }
+    
+    // 计算新交易哈希
     std::string new_txs_hash;
-    if (temp_transactions.empty()) {
+    if (new_transactions.empty()) {
         new_txs_hash = ComputeSHA256String("EMPTY");
     } else {
         std::string combined;
-        for (const auto& t : temp_transactions) combined += t.ComputeHash();
+        for (const auto& tx : new_transactions) combined += tx.ComputeHash();
         new_txs_hash = ComputeSHA256String(combined);
     }
     
-    // ==================== 第五步：更新所有管理员的随机数 ====================
-    std::string new_G_encrypted = UpdateAllManagersRandomNumbers(
-        managers, old_txs_hash, old_G_encrypted, new_txs_hash);
+    std::string new_F = XorStringsInternal(old_F, extended_old_hash);
+    new_F = XorStringsInternal(new_F, ExtendHashToLength(new_txs_hash, old_F.length()));
     
-    if (new_G_encrypted.empty()) {
-        std::cout << "  管理员随机数更新失败" << std::endl;
+    // 验证核心不变性
+    std::string new_extended_hash = ExtendHashToLength(new_txs_hash, new_F.length());
+    std::string new_xor = XorStringsInternal(new_extended_hash, new_F);
+    std::string new_sig = ComputeSHA256String(new_xor);
+    
+    //std::cout << "  新计算的签名: " << new_sig << std::endl;
+    
+    if (computed_sig != new_sig) {
+        std::cerr << "错误: 核心不变性验证失败!" << std::endl;
         return false;
     }
     
-    // ==================== 第六步：验证核心不变性 ====================
-    std::string new_xor = XorStringsInternal(new_txs_hash, new_G_encrypted);
-    std::string new_xor_hash = ComputeSHA256String(new_xor);
+    std::cout << "正确：核心不变性成立" << std::endl;
     
+    // 更新每个管理员的随机数
+    size_t num_managers = all_managers.size();
+    size_t slice_len = new_F.length() / num_managers;
+    std::string extended_old_hash_slice = ExtendHashToLength(old_txs_hash, slice_len);
+    std::string extended_new_hash_slice = ExtendHashToLength(new_txs_hash, slice_len);
     
-    if (old_xor_hash != new_xor_hash) {
-        std::cerr << "错误: 异或值哈希不匹配!" << std::endl;
-        return false;
+    for (size_t i = 0; i < num_managers; i++) {
+        std::string new_slice = new_F.substr(i * slice_len, slice_len);
+        
+        // 解密得到新的随机数
+        std::string new_random = ECIESDecrypt(new_slice, all_managers[i]->msk);
+        if (!new_random.empty() && new_random != "0") {
+            BN_free(all_managers[i]->random_x);
+            all_managers[i]->random_x = BN_new();
+            BN_hex2bn(&all_managers[i]->random_x, new_random.c_str());
+            all_managers[i]->SaveToFile(key_dir_);
+            std::cout << "  管理员 " << all_managers[i]->entity_id << " 随机数已更新" << std::endl;
+        } else {
+            // 如果解密失败，使用异或计算新随机数
+            std::string old_slice = old_F.substr(i * slice_len, slice_len);
+            std::string old_random = ECIESDecrypt(old_slice, all_managers[i]->msk);
+            if (!old_random.empty()) {
+                BIGNUM* old_bn = BN_new();
+                BIGNUM* old_hash_bn = BN_new();
+                BIGNUM* new_hash_bn = BN_new();
+                BN_hex2bn(&old_bn, old_random.c_str());
+                BN_hex2bn(&old_hash_bn, extended_old_hash_slice.c_str());
+                BN_hex2bn(&new_hash_bn, extended_new_hash_slice.c_str());
+                
+                BIGNUM* new_bn = BN_new();
+                BN_mod_add(new_bn, old_bn, old_hash_bn, current_params_->q, current_params_->ctx);
+                BN_mod_sub(new_bn, new_bn, new_hash_bn, current_params_->q, current_params_->ctx);
+                
+                char* new_hex = BN_bn2hex(new_bn);
+                BN_free(all_managers[i]->random_x);
+                all_managers[i]->random_x = new_bn;
+                all_managers[i]->SaveToFile(key_dir_);
+                OPENSSL_free(new_hex);
+                BN_free(old_bn);
+                BN_free(old_hash_bn);
+                BN_free(new_hash_bn);
+                std::cout << "  管理员 " << all_managers[i]->entity_id << " 随机数已通过计算更新" << std::endl;
+            }
+        }
     }
     
-    std::cout << "    核心不变性验证通过: H(τ_i) ⊕ G = H(τ_i') ⊕ G'" << std::endl;
-    
-    // ==================== 第七步：计算新签名 ====================
-    std::string new_xor_signature = ComputeSHA256String(new_xor);
-    
-    // ==================== 第八步：执行物理撤销 ====================
-    bool success = blockchain_->PhysicalRevokeTransaction(aid, new_xor_signature);
-    
+    bool success = blockchain_->PhysicalRevokeTransaction(aid, new_sig);
     if (success) {
         revoke_history_.push_back({aid, reason});
         std::cout << "\n  物理撤销成功!" << std::endl;
@@ -1350,11 +1507,14 @@ std::vector<std::pair<std::string, std::string>> EcoRedactSystem::GetRevokeHisto
     return revoke_history_;
 }
 
+std::vector<ModificationRecord> EcoRedactSystem::GetModificationHistory() {
+    return blockchain_->GetModificationHistory();
+}
+
 std::vector<uint8_t> EcoRedactSystem::ComputeSHA256(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
     SHA256(data.data(), data.size(), hash.data());
     return hash;
 }
-
 
 } // namespace EcoRedact
