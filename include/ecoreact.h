@@ -16,45 +16,46 @@
 #include <utility>
 #include <memory>
 #include <tuple>
+#include "blockchain.h"
 
 namespace EcoRedact {
 
+// 前向声明
 class Blockchain;
 struct TransactionSubBlock;
+struct Block;
+struct ModificationRecord;
 
-// ==================== 实体类型枚举 ====================
-
+// 实体类型枚举
 enum class EntityType {
-    VEHICLE,    // 车辆 V
-    MANAGER,    // 管理员群组 M
-    RSU         // 路边单元 RSU
+    VEHICLE,
+    MANAGER,
+    RSU
 };
 
-// ==================== 阶段一: 系统初始化相关结构 ====================
-
+// 阶段一: 系统初始化相关结构
 struct SystemParams {
-    EC_GROUP* group;   // 加法循环群 G
-    EC_POINT* P;       // 生成元 P
-    BIGNUM* q;         // 群的阶 q
+    EC_GROUP* group;
+    EC_POINT* P;
+    BIGNUM* q;
     BN_CTX* ctx;
     
     SystemParams();
     ~SystemParams();
 };
 
-// ==================== 车辆存储结构 ====================
-
+// 车辆存储结构
 struct VehicleStorage {
-    std::string entity_id;           // 车辆标识符 V_i
-    BIGNUM* vsk;                     // 真实私钥 vsk_i
-    EC_POINT* vpk;                   // 真实公钥 vpk_i = vsk_i · P
-    std::string certificate;         // 公钥证书 Cert_i
+    std::string entity_id;
+    BIGNUM* vsk;
+    EC_POINT* vpk;
+    std::string certificate;
     
-    BIGNUM* ask_root;                // 根匿名私钥 ask_i^r
-    EC_POINT* apk_root;              // 根匿名公钥 apk_i^r = ask_root · P
-    EC_POINT* vapk_root;             // 根条件验证公钥 vapk_i^r = vpk_i + ask_root · mpk_j
-    std::string deri_root;           // 根派生信息 deri_i^r
-    std::string aid;                 // 匿名身份标识 AID_i = H(apk_root || Key)
+    BIGNUM* ask_root;
+    EC_POINT* apk_root;
+    EC_POINT* vapk_root;
+    std::string deri_root;
+    std::string aid;
     
     VehicleStorage();
     ~VehicleStorage();
@@ -64,16 +65,15 @@ struct VehicleStorage {
     bool LoadFromFile(const std::string& dir, const std::string& id);
 };
 
-// ==================== 管理员存储结构 ====================
-
+// 管理员存储结构
 struct ManagerStorage {
-    std::string entity_id;           // 管理员标识符 M_j
-    BIGNUM* msk;                     // 管理员私钥 msk_j
-    EC_POINT* mpk;                   // 管理员公钥 mpk_j = msk_j · P
+    std::string entity_id;
+    BIGNUM* msk;
+    EC_POINT* mpk;
     
-    int committed_space;             // 承诺空间大小 (MB)
-    double last_quality;             // 最后一次证明质量 v
-    BIGNUM* random_x;                // 专属随机数 x_i (用于机动因子生成)
+    int committed_space;
+    double last_quality;
+    BIGNUM* random_x;
     
     ManagerStorage();
     ~ManagerStorage();
@@ -83,12 +83,11 @@ struct ManagerStorage {
     bool LoadFromFile(const std::string& dir, const std::string& id);
 };
 
-// ==================== RSU存储结构 ====================
-
+// RSU存储结构
 struct RSUStorage {
-    std::string entity_id;           // RSU标识符 R_l
-    BIGNUM* rsk;                     // RSU私钥 rsk_l
-    EC_POINT* rpk;                   // RSU公钥 rpk_l = rsk_l · P
+    std::string entity_id;
+    BIGNUM* rsk;
+    EC_POINT* rpk;
     
     RSUStorage();
     ~RSUStorage();
@@ -98,49 +97,51 @@ struct RSUStorage {
     bool LoadFromFile(const std::string& dir, const std::string& id);
 };
 
-// ==================== 阶段三: 匿名通信相关结构 ====================
-
+// 知识签名
 struct SignatureOfKnowledge {
-    EC_POINT* Pr1;          // 承诺 Pr_{i,1} = r1 · P
-    EC_POINT* Pr2;          // 承诺 Pr_{i,2} = r2 · P + r1 · mpk_j
-    BIGNUM* Ch;             // 挑战值 Ch_i
-    BIGNUM* Rp1;            // 响应 Rp_{i,1} = r1 - ask_i^k · Ch_i (mod q)
-    BIGNUM* Rp2;            // 响应 Rp_{i,2} = r2 - vsk_i · Ch_i (mod q)
-    std::string timestamp;  // 时间戳 t_s
+    EC_POINT* Pr1;
+    EC_POINT* Pr2;
+    BIGNUM* Ch;
+    BIGNUM* Rp1;
+    BIGNUM* Rp2;
+    std::string timestamp;
     
     SignatureOfKnowledge();
     ~SignatureOfKnowledge();
 };
 
+// 周期证明
 struct PeriodProof {
-    std::string h_commit;               // 承诺值 h_commit = H(apk || k)
-    uint64_t valid_until;               // 有效期截止时间 T_end
-    std::string rsu_signature;          // RSU签名 σ_RSU
+    std::string h_commit;
+    uint64_t valid_until;
+    std::string rsu_signature;
     
     std::string ToString() const;
 };
 
+// 车辆消息
 struct VehicleMessage {
-    std::string msg;                    // 交通消息 msg
-    EC_POINT* apk;                      // 匿名公钥 apk_i^k
-    EC_POINT* vapk;                     // 条件验证公钥 vapk_i^k
-    std::string timestamp;              // 时间戳 t_s
-    SignatureOfKnowledge signature;     // 知识签名 σ
-    PeriodProof period_proof;           // 周期证明
+    std::string msg;
+    std::string aid;
+    EC_POINT* apk;
+    EC_POINT* vapk;
+    std::string timestamp;
+    SignatureOfKnowledge signature;
+    PeriodProof period_proof;
+    
     VehicleMessage();
     ~VehicleMessage();
 };
 
-// ==================== 阶段二: 注册请求类 ====================
-
+// 注册请求类
 class RegisterRequest {
 public:
-    EC_POINT* apk_root;     // 根匿名公钥 apk_i^r
-    EC_POINT* vapk_root;    // 根条件验证公钥 vapk_i^r
-    std::string deri_root;  // 根派生信息 deri_i^r
-    std::string certificate; // 车辆公钥证书 Cert_i
-    std::string signature;   // 车辆签名 Sign_i
-    std::string aid;         // 匿名身份标识 AID_i
+    EC_POINT* apk_root;
+    EC_POINT* vapk_root;
+    std::string deri_root;
+    std::string certificate;
+    std::string signature;
+    std::string aid;
     
     RegisterRequest();
     ~RegisterRequest();
@@ -158,16 +159,16 @@ public:
     bool Deserialize(const std::string& data, SystemParams* params);
 };
 
-// ==================== EcoRedact 系统主类 ====================
-
+// EcoRedact 系统主类
 class EcoRedactSystem {
 public:
     EcoRedactSystem();
     ~EcoRedactSystem();
 
-    // ==================== 阶段一: 系统初始化 ====================
+    // 系统初始化
     SystemParams* Setup(int curve_nid = NID_secp256k1);
     
+    // 创建实体
     VehicleStorage* CreateVehicle(const std::string& vehicle_id);
     ManagerStorage* CreateManager(const std::string& manager_id, int committed_space);
     RSUStorage* CreateRSU(const std::string& rsu_id);
@@ -176,36 +177,35 @@ public:
     ManagerStorage* LoadManager(const std::string& manager_id);
     RSUStorage* LoadRSU(const std::string& rsu_id);
     
-    // 获取所有管理员列表
     const std::vector<ManagerStorage*>& GetAllManagers() const { return all_managers_; }
     
-    // ==================== 阶段二: 匿名公钥上链 ====================
+    // 空间证明竞争
     std::pair<ManagerStorage*, std::vector<std::pair<std::string, double>>> 
     PoSpaceRacing(std::vector<ManagerStorage*>& managers);
     
+    // 匿名公钥上链
     void GenerateRootKey(SystemParams* params, VehicleStorage* vehicle, EC_POINT* mpk);
-    
     RegisterRequest BuildRegisterRequest(SystemParams* params, VehicleStorage* vehicle,
                                           EC_POINT* mpk, const std::string& manager_id);
-    
     bool ProcessRegisterRequest(SystemParams* params, const RegisterRequest& req,
                                  ManagerStorage* manager);
     
     Blockchain* GetBlockchain() { return blockchain_; }
     
-    // ==================== 机动因子管理 (核心可编辑机制) ====================
-    
-    // 生成机动因子 G_i
+    // 机动因子管理
     std::string GenerateMobilityFactor(const std::vector<ManagerStorage*>& managers);
+    std::string UpdateAllManagersRandomNumbersSafe(
+        const std::vector<ManagerStorage*>& managers,
+        const std::string& old_txs_hash,
+        const std::string& old_F_encrypted,
+        const std::string& new_txs_hash);
     
-    // 撤销时，所有管理员协作更新自己的随机数
-    std::string UpdateAllManagersRandomNumbers(
-    const std::vector<ManagerStorage*>& managers,
-    const std::string& old_txs_hash,
-    const std::string& old_G_encrypted,
-    const std::string& new_txs_hash);
+    void UpdateManagerRankings(const std::vector<std::pair<std::string, double>>& qualities);
     
-    // ==================== 阶段三: 匿名通信 ====================
+    // 辅助函数
+    std::string ExtendHashToLength(const std::string& hash, size_t target_len);
+    
+    // 匿名通信
     EC_POINT* GetRootAPKByAID(const std::string& aid);
     
     std::tuple<BIGNUM*, EC_POINT*, EC_POINT*, std::string> 
@@ -227,7 +227,6 @@ public:
     
     PeriodProof PeriodProofGen(RSUStorage* rsu, const std::string& aid,
                                 EC_POINT* apk, int key_index, int duration);
-    
     bool PeriodProofVerify(const PeriodProof& proof, EC_POINT* rsu_pk);
     
     SignatureOfKnowledge SoKGen(SystemParams* params, const std::string& msg,
@@ -238,10 +237,10 @@ public:
     bool SoKVerify(SystemParams* params, const std::string& msg,
                    const SignatureOfKnowledge& sig,
                    EC_POINT* apk, EC_POINT* vapk, EC_POINT* mpk,
-                   const PeriodProof& proof);
+                   const PeriodProof& proof, EC_POINT* rsu_pk);
     
-    // ==================== 车辆间通信模拟 ====================
     VehicleMessage SendMessage(SystemParams* params, const std::string& msg,
+                                const std::string& aid,
                                 EC_POINT* apk, EC_POINT* vapk,
                                 const SignatureOfKnowledge& sig,
                                 const PeriodProof& proof);
@@ -249,19 +248,22 @@ public:
     bool ReceiveAndVerify(SystemParams* params, const VehicleMessage& msg,
                           EC_POINT* mpk, EC_POINT* rsu_pk);
     
-    // ==================== 阶段四: 匿名公钥撤销 ====================
+    // 匿名公钥撤销
     bool AnonKeyRevoke(const std::string& aid, const std::string& reason,
                        const std::vector<ManagerStorage*>& managers);
     
     bool IsAIDRevoked(const std::string& aid);
     std::vector<std::pair<std::string, std::string>> GetRevokeHistory();
+    std::vector<ModificationRecord> GetModificationHistory();
 
+    // 追溯验证
+    bool TraceVerify(const std::string& aid, EC_POINT* vpk, BIGNUM* msk);
 
 private:
     std::string key_dir_ = "./keys/";
     SystemParams* current_params_;
     Blockchain* blockchain_;
-    std::vector<ManagerStorage*> all_managers_;  // 所有管理员列表
+    std::vector<ManagerStorage*> all_managers_;
     std::vector<TransactionSubBlock> pending_transactions_;
     std::vector<std::pair<std::string, std::string>> revoke_history_;
     
@@ -272,15 +274,9 @@ private:
     std::vector<uint8_t> HexToBytes(const std::string& hex);
     std::vector<uint8_t> ComputeSHA256(const std::vector<uint8_t>& data);
     
-    // AES-CTR 加密/解密（线性加密，支持密文异或）
-    std::vector<unsigned char> DeriveKeyFromPublicKey(EC_POINT* pk);
-    std::vector<unsigned char> DeriveKeyFromPrivateKey(BIGNUM* private_key);
-    std::string AESCTREncrypt(const std::vector<unsigned char>& key, const std::string& plaintext);
-    std::string AESCTRDecrypt(const std::vector<unsigned char>& key, const std::string& ciphertext);
-    
-    // 使用管理员公钥/私钥的加密解密
-    std::string EncryptWithManagerKey(const std::string& plaintext, EC_POINT* manager_pk);
-    std::string DecryptWithManagerKey(const std::string& ciphertext, BIGNUM* manager_sk);
+    // ECIES加密/解密（陷门单向函数）
+    std::string ECIESEncrypt(const std::string& plaintext, EC_POINT* public_key);
+    std::string ECIESDecrypt(const std::string& ciphertext, BIGNUM* private_key);
 };
 
 } // namespace EcoRedact
